@@ -54,7 +54,10 @@ if (NOT DEFINED PXR_FIND_TBB_IN_CONFIG)
 endif()
 if (PXR_FIND_TBB_IN_CONFIG)
     find_dependency(TBB @TBB_VERSION@ CONFIG)
-else()
+elseif (NOT TARGET TBB::tbb)
+    # Guard against double inclusion: consumers that call find_package(pxr)
+    # from more than one directory scope would otherwise fail with
+    # "add_library cannot create imported target TBB::tbb".
     add_library(TBB::tbb SHARED IMPORTED)
 
     macro(_add_property name value)
@@ -113,6 +116,13 @@ if(NOT "@PXR_WORK_IMPL_PACKAGE@" STREQUAL "")
         endif()
     endif()
     find_dependency(@PXR_WORK_IMPL_PACKAGE@)
+endif()
+
+# When GL support is enabled, imaging targets (garch, glf, hgiGL, ...) carry
+# OpenGL::GL in their link interfaces; find it for consumers so they don't
+# each have to call find_package(OpenGL) before find_package(pxr).
+if ("@PXR_ENABLE_GL_SUPPORT@" AND NOT TARGET OpenGL::GL)
+    find_dependency(OpenGL)
 endif()
 
 include("${PXR_CMAKE_DIR}/cmake/pxrTargets.cmake")
