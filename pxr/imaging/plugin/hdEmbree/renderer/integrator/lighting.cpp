@@ -34,11 +34,18 @@ ty::Renderer::_AccumulateEnvironment(_PathState* state) const
         return;
     }
 
+    // A camera-visible dome makes the renderer the author of the background.
+    // Without one the background is the color clear value, and whatever the
+    // client composites under the color AOV.
+    const bool rendererDrawsBackground =
+        !_lights.GetDomes().empty() && _settings.domeLightCameraVisibility;
+    const GfVec3f clearRgb(
+        _colorClearValue[0], _colorClearValue[1], _colorClearValue[2]);
+
     if (state->isFirstBounce) {
-        if (_lights.GetDomes().empty() ||
-            !_settings.domeLightCameraVisibility) {
-            state->radianceAccumulated = GfVec3f(
-                _colorClearValue[0], _colorClearValue[1], _colorClearValue[2]);
+        if (!rendererDrawsBackground) {
+            state->radianceAccumulated = clearRgb;
+            state->backgroundVisibility += 1.0f;
             return;
         }
 
@@ -50,6 +57,23 @@ ty::Renderer::_AccumulateEnvironment(_PathState* state) const
                         .radianceIn;
             }
         }
+        return;
+    }
+
+    // Reaching the background without ever redirecting the view is the same
+    // event as a camera miss, only attenuated by what the path transmitted
+    // through. Report that fraction as coverage and take the clear value as
+    // its radiance, exactly as the first bounce does, so a client backplate
+    // shows through glass and through UsdPreviewSurface opacity. Evaluating
+    // the environment here as well would let the backplate contribute twice
+    // once the client composites underneath. An opaque film has no client
+    // backplate to double, so it keeps the environment.
+    if (!rendererDrawsBackground && state->straightFromCamera &&
+        _colorClearValue[3] < 1.0f) {
+        const GfVec3f throughputRgb = _GetPathThroughputRgb(*state);
+        state->backgroundVisibility +=
+            (throughputRgb[0] + throughputRgb[1] + throughputRgb[2]) / 3.0f;
+        _AddPathRadiance(_WeightPathRadiance(clearRgb, *state), state);
         return;
     }
 

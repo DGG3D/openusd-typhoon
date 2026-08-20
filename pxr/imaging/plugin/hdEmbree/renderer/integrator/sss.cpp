@@ -994,6 +994,7 @@ ty::Renderer::_TraceSubsurface(
     state->lastScatterWasMedium = false;
     state->hasDiffuseLikeAncestor = true;
     state->isFirstBounce = false;
+    state->straightFromCamera = false;
     state->syntheticLambertianExit = output;
     state->useSyntheticLambertian = true;
     state->medium = ty::MediumState();

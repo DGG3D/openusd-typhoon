@@ -698,6 +698,11 @@ ty::Renderer::_IntegratePath(
         if (bs.isDiffuseLike) {
             path.hasDiffuseLikeAncestor = true;
         }
+        // Only a non-diffuse transmission leaves the view through the surface
+        // intact. Reflection, diffuse transmission, and scattering all replace
+        // the background with rendered radiance for the rest of this path.
+        path.straightFromCamera =
+            path.straightFromCamera && bs.isTransmission && !bs.isDiffuseLike;
         path.isFirstBounce = false;
         // Transmission enters or leaves the interior medium; only one
         // active owner is currently modeled.
@@ -788,10 +793,16 @@ ty::Renderer::_IntegratePath(
         ++bounce;
     }
 
-    // Pack finite, non-negative display radiance; alpha remains opaque.
+    // Pack finite, non-negative display radiance premultiplied by coverage.
+    // An opaque clear value keeps alpha at one whatever the path did; a
+    // non-opaque one uncovers the pixel in proportion to the camera
+    // throughput that escaped, so a client can composite its own backplate.
+    const float alpha =
+        1.0f - ty::Clamp01(path.backgroundVisibility) *
+                   (1.0f - _colorClearValue[3]);
     result.color = GfVec4f(std::max(0.0f, path.radianceAccumulated[0]),
                            std::max(0.0f, path.radianceAccumulated[1]),
-                           std::max(0.0f, path.radianceAccumulated[2]), 1.0f);
+                           std::max(0.0f, path.radianceAccumulated[2]), alpha);
     return result;
 }
 

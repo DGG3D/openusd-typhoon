@@ -447,7 +447,10 @@ ty::Renderer::_ClassifyAovOutputs()
     _aovOutputs.clear();
     _needRadiance = false;
     _needAmbientOcclusion = false;
-    _colorClearValue = GfVec4f(0.0f);
+    // Opaque until a bound color AOV says otherwise: without one there is no
+    // film for a client to composite under, and radiance evaluated for the
+    // adaptive heatmap must not change because of an absent binding.
+    _colorClearValue = GfVec4f(0.0f, 0.0f, 0.0f, 1.0f);
 
     // Color and adaptive-heatmap output both require actual scene radiance.
     // The latter keeps adaptive statistics meaningful without a color buffer.

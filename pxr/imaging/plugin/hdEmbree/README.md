@@ -383,6 +383,63 @@ the expected product absent so `usdrender` reports an error.
 | `adaptiveHeatmap` | `Float32Vec4` |
 | `ambocc` | `Float32Vec3` |
 
+### Transparent background and the color AOV's alpha
+
+The `color` AOV is premultiplied by alpha, and the alpha of the clear value you
+bind decides what alpha means. Clear it opaque and every pixel comes back
+opaque, exactly as before this behavior existed. Clear it non-opaque and alpha
+reports how much of the pixel the scene covers, so an application that draws
+its own backdrop — a GL skybox, a gradient, a plate — can composite the render
+over it. `HdxPresentTask` already blends the AOV with premultiplied alpha, so
+no extra work is needed on the client side beyond the clear value:
+
+```cpp
+// Bind color and ask for a transparent film.
+taskController->SetRenderOutputs({ HdAovTokens->color });
+HdAovDescriptor desc =
+    taskController->GetRenderOutputSettings(HdAovTokens->color);
+desc.clearValue = VtValue(GfVec4f(0.0f, 0.0f, 0.0f, 0.0f));
+taskController->SetRenderOutputSettings(HdAovTokens->color, desc);
+
+// Your backdrop, not the renderer's.
+renderDelegate->SetRenderSetting(
+    HdRenderSettingsTokens->domeLightCameraVisibility, VtValue(false));
+```
+
+Coverage is not just a background test. It follows the camera through
+surfaces that do not redirect the view, so your backdrop also shows through:
+
+- pixels where the camera ray escapes the scene entirely;
+- clear glass, and any other specular or glossy transmission;
+- `UsdPreviewSurface` with `opacity < 1` in either opacity mode;
+- geometry made partly absent by `presence`.
+
+Anything that reflects or diffuses ends coverage for that path, so a chrome
+ball reflecting the environment, a diffuse surface, subsurface scattering, and
+volume scattering all stay opaque. Silhouettes antialias against your backdrop
+rather than against black, because coverage is averaged per sample.
+
+A camera-visible dome light means the renderer is drawing the background
+itself, and then the image stays opaque no matter what the clear value says.
+That is why `domeLightCameraVisibility = false` belongs with a transparent
+film: it is what hands the background back to you. When it is set, a path that
+reaches the background straight from the camera reports coverage *instead of*
+picking up dome and distant-light radiance, so your backdrop is not counted
+twice once you composite underneath.
+
+Known limits, all inherent to compositing over a flat backdrop:
+
+- alpha is one channel, so colored glass tints your backdrop approximately;
+- the backdrop you composite is undistorted, so rough or strongly refractive
+  transmission shows a backdrop that neither bends nor blurs;
+- with a non-black transparent clear value such as `(0.5, 0.5, 0.5, 0)`, the
+  RGB is treated as already premultiplied and passes through as-is.
+
+`usdrender` and `usdrecord` clear the color AOV to `(0, 0, 0, 0)`, so scenes
+with no camera-visible dome light now write images with a transparent
+background, matching Storm. Add a camera-visible dome light, or clear the AOV
+opaque, for a fully opaque frame.
+
 ### Adaptive heatmap
 When this AOV is bound, it accumulates a heatmap of per-pixel sampling
 progress. After the adaptive sample counter is advanced, each sample maps

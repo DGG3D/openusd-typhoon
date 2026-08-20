@@ -668,6 +668,8 @@ volume, environment, and SSS handlers. It contains:
 - the previous BSDF PDF and light-sampling mode used for MIS;
 - receiver categories used for light and shadow linking;
 - diffuse/specular ancestry used by caustic policy;
+- straight-from-camera eligibility and accumulated background visibility, used
+  by non-opaque film coverage;
 - first-segment state, bounce count, and a separate path-event index.
 
 The bounce count is incremented explicitly only after a surface or medium
@@ -716,10 +718,14 @@ For each segment, `_IntegratePath()` performs these stages in order:
    - A camera miss returns the clear color when no dome is registered or dome
      camera visibility is disabled. Otherwise it evaluates visible domes in the
      camera direction. Distant lights are not camera backgrounds.
-   - An indirect miss evaluates visible distant and dome lights. It applies
-     light linking from the previous scattering surface and MIS against the
-     previous BSDF PDF. Dome camera visibility does not suppress indirect dome
-     illumination.
+   - A miss on a path that is still straight from the camera behaves the same
+     way, attenuated by what the path transmitted, but only while the renderer
+     is not drawing the background and the color clear value is not opaque.
+     See [Non-opaque film coverage](#non-opaque-film-coverage).
+   - Any other indirect miss evaluates visible distant and dome lights. It
+     applies light linking from the previous scattering surface and MIS against
+     the previous BSDF PDF. Dome camera visibility does not suppress indirect
+     dome illumination.
 
 7. **Reject an ordinary surface on the emitter-only iteration.** Once the
    surface-bounce budget is exhausted, the extra iteration exists only to see
@@ -904,6 +910,46 @@ branch inside the lit path:
 It performs no material-closure evaluation, normal or derivative construction,
 scene-light sampling, emissive transport, indirect bounces, MIS,
 participating-medium transport, ambient visibility, or Russian roulette.
+
+### Non-opaque film coverage
+
+The color AOV's alpha is scene coverage, so a client that draws its own
+backplate can composite the render over it. The clear value's alpha selects the
+behavior, which keeps the contract in the same place Storm and usdview put it
+and adds no render setting:
+
+- an opaque clear value produces alpha one everywhere, whatever the path did;
+- a non-opaque clear value uncovers each pixel in proportion to the camera
+  throughput that escaped the scene.
+
+Both integrators pack `alpha = 1 - backgroundVisibility * (1 - clearValue.a)`,
+where `backgroundVisibility` is the fraction of the pixel sample's camera
+throughput that left the scene while still looking at the background. A path is
+*straight from the camera* while every event so far passed through a surface
+without redirecting the view: a rejected presence sample, a volume-only
+boundary, or a non-diffuse transmission. Reflection, diffuse transmission,
+subsurface entry, and medium scattering all end eligibility permanently,
+because from there the pixel shows rendered radiance rather than the
+background.
+
+A straight-from-camera escape takes the clear value as its radiance and does
+*not* evaluate distant or dome lights. This generalizes the camera-miss rule to
+the transmissive case: the renderer is not drawing the background, so adding
+environment radiance as well would make the client's backplate contribute twice
+once it composites underneath. The renderer *is* the author of the background
+whenever a camera-visible dome exists, and then no coverage is reported at all;
+that case, and every opaque-film case, is bit-identical to a renderer without
+this feature.
+
+Multisampled resolve averages all four components, so per-sample coverage
+becomes fractional alpha on silhouettes and geometry antialiases against the
+client's backplate. Consequences worth knowing:
+
+- alpha is a single channel, so colored glass transmits an approximate tint;
+- the backplate the client composites is undistorted, so a rough or strongly
+  refractive transmission composites a backdrop that does not bend or blur;
+- total internal reflection and absorption need no special handling, because
+  throughput already accounts for them and alpha rises back toward one.
 
 ### Accumulation and AOV output
 

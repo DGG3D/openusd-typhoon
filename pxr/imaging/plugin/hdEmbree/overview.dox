@@ -60,6 +60,10 @@ USD render-settings schema, not its internal C++ module boundaries.
 - The delegate supports standard color, depth, normal, and ID AOVs, the
   `adaptiveHeatmap` and `ambocc` diagnostics, and float-vector primvar outputs.
   `README.md` defines the authoritative names and formats.
+- The color AOV is premultiplied by alpha, and its bound clear value's alpha
+  selects what alpha means. An opaque clear value produces an opaque image; a
+  non-opaque one reports scene coverage, so background pixels and pixels seen
+  through transmission composite over client-drawn content.
 - Progressive radiance rendering always uses adaptive sampling. The
   `adaptiveHeatmap` diagnostic is computed only when its AOV is bound and does
   not replace color output.

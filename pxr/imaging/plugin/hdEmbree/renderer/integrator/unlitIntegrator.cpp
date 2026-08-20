@@ -34,11 +34,10 @@ ty::Renderer::_IntegrateUnlit(
     }
 
     if (rayHit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
-        result.color = GfVec4f(
-            _colorClearValue[0],
-            _colorClearValue[1],
-            _colorClearValue[2],
-            1.0f);
+        // Display-color shading has no transport to attenuate, so a camera
+        // miss is the whole background: it takes the clear value, alpha
+        // included, and leaves the pixel as uncovered as the client asked.
+        result.color = _colorClearValue;
         return result;
     }
 

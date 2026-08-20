@@ -273,6 +273,7 @@ ty::Renderer::_TraceVolumeTransmission(
             state->lastScatterCategories = mediumState.categories;
             state->hasDiffuseLikeAncestor = true;
             state->isFirstBounce = false;
+            state->straightFromCamera = false;
             return _VolumeTransmissionResult::ContinueRay;
         }
 

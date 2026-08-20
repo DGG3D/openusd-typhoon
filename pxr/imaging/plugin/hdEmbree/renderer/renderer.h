@@ -375,7 +375,10 @@ private:
     struct _PixelSampleResult {
         /// First Embree intersection, retained unchanged for geometric AOVs.
         RTCRayHit primaryHit{};
-        /// Linear, unexposed RGBA radiance; alpha is one when computed.
+        /// Linear, unexposed RGBA radiance, premultiplied by alpha. Alpha is
+        /// how much of the pixel the scene covers: one for an opaque color
+        /// clear value, and lower where camera throughput escaped a film the
+        /// client asked to keep non-opaque.
         GfVec4f color = GfVec4f(0.0f);
         /// Binary ambient visibility, or zero when no AO ray is issued.
         float ambientVisibility = 0.0f;
@@ -617,6 +620,16 @@ private:
         bool isFirstBounce = true;
         bool hasDiffuseLikeAncestor = false;
         bool currentPathIsCaustic = false;
+
+        // Non-opaque film coverage. A path is straight from the camera while
+        // every event so far passed through the surface without redirecting
+        // the view: presence rejection, a medium-only boundary, or a
+        // non-diffuse transmission. Such a path still looks at the background,
+        // so the throughput it carries out of the scene is the fraction of the
+        // pixel a client backplate shows through. Reflecting or scattering
+        // replaces that view with rendered radiance and ends eligibility.
+        bool straightFromCamera = true;
+        float backgroundVisibility = 0.0f;
 
         bool useSyntheticLambertian = false;
         SssOutput syntheticLambertianExit;

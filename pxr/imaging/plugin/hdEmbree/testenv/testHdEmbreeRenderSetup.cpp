@@ -1291,6 +1291,11 @@ struct _DisplayColorRenderCase
     int samplesToConvergence = 1;
     int minSamplesBeforeAdaptive = 64;
     bool tiltSurface = false;
+    // Empty leaves the renderer's opaque default in place. A non-opaque value
+    // asks for scene coverage in the color AOV's alpha.
+    VtValue colorClearValue;
+    // Authored on the test material; below one it becomes transmission.
+    float materialOpacity = 1.0f;
 };
 
 struct _SurfaceRenderResult
@@ -1302,7 +1307,7 @@ struct _SurfaceRenderResult
 };
 
 HdMaterialNetwork2
-_MakeDisplayColorTestMaterial()
+_MakeDisplayColorTestMaterial(float opacity)
 {
     HdMaterialNetwork2 network;
     const SdfPath surfacePath("/Material/Surface");
@@ -1310,6 +1315,9 @@ _MakeDisplayColorTestMaterial()
     surface.nodeTypeId = TfToken("UsdPreviewSurface");
     surface.parameters[TfToken("diffuseColor")] =
         VtValue(GfVec3f(0.8f, 0.05f, 0.05f));
+    // Opacity one is UsdPreviewSurface's default, so authoring it leaves
+    // every other case exactly as it was.
+    surface.parameters[TfToken("opacity")] = VtValue(opacity);
     network.nodes[surfacePath] = surface;
     network.terminals[TfToken("surface")] =
         HdMaterialConnection2{surfacePath, TfToken("out")};
@@ -1348,7 +1356,9 @@ _RenderSurfaceCase(
     const SdfPath materialId("/displayColorMaterial");
     if (renderCase.bindMaterial) {
         sceneDelegate.AddMaterialResource(
-            materialId, VtValue(_MakeDisplayColorTestMaterial()));
+            materialId,
+            VtValue(
+                _MakeDisplayColorTestMaterial(renderCase.materialOpacity)));
     }
     const VtVec3fArray points = renderCase.tiltSurface
         ? VtVec3fArray{
@@ -1428,7 +1438,10 @@ _RenderSurfaceCase(
     }
     HdRenderPassAovBindingVector bindings;
     if (renderCase.bindColor) {
-        bindings.push_back(_Binding(HdAovTokens->color, &color));
+        HdRenderPassAovBinding colorBinding =
+            _Binding(HdAovTokens->color, &color);
+        colorBinding.clearValue = renderCase.colorClearValue;
+        bindings.push_back(colorBinding);
     }
     if (renderCase.bindAmbientOcclusion) {
         bindings.push_back(
@@ -1591,6 +1604,88 @@ _TestDisplayColorFallbacks()
             GfVec4f(0.0f, 0.0f, 0.0f, 1.0f),
             1.0e-6f)) {
         std::printf("lit fallback generated radiance without a light\n");
+        return false;
+    }
+
+    return true;
+}
+
+bool
+_TestNonOpaqueFilmCoverage()
+{
+    // A client compositing its own backplate binds a non-opaque clear value.
+    // Alpha then reports how much of the pixel the scene covers, so escaped
+    // camera throughput leaves the backplate visible. An opaque clear value
+    // must keep every pixel opaque no matter what the path did.
+    const VtValue transparentClear{GfVec4f(0.0f, 0.0f, 0.0f, 0.0f)};
+    const VtValue opaqueClear{GfVec4f(0.0f, 0.0f, 0.0f, 1.0f)};
+
+    _DisplayColorRenderCase missCase;
+    missCase.lightingEnabled = true;
+    missCase.addDistantLight = true;
+    missCase.moveCameraToMissAfterFirstRender = true;
+
+    _DisplayColorRenderCase surfaceCase;
+    surfaceCase.lightingEnabled = true;
+    surfaceCase.addDistantLight = true;
+    surfaceCase.bindMaterial = true;
+    // A stochastic transmission lobe needs more than the one sample the
+    // other display-color cases use before its average alpha is meaningful.
+    surfaceCase.samplesToConvergence = 64;
+
+    _DisplayColorRenderCase transparentMiss = missCase;
+    transparentMiss.colorClearValue = transparentClear;
+    _DisplayColorRenderCase opaqueMiss = missCase;
+    opaqueMiss.colorClearValue = opaqueClear;
+    GfVec4f transparentMissColor;
+    GfVec4f opaqueMissColor;
+    if (!_RenderDisplayColorCase(transparentMiss, &transparentMissColor) ||
+        !_RenderDisplayColorCase(opaqueMiss, &opaqueMissColor)) {
+        return false;
+    }
+    if (transparentMissColor[3] > 1.0e-5f) {
+        std::printf("camera miss stayed opaque under a transparent clear\n");
+        return false;
+    }
+    if (!GfIsClose(opaqueMissColor[3], 1.0f, 1.0e-5f)) {
+        std::printf("camera miss lost coverage under an opaque clear\n");
+        return false;
+    }
+
+    _DisplayColorRenderCase opaqueSurface = surfaceCase;
+    opaqueSurface.colorClearValue = transparentClear;
+    GfVec4f opaqueSurfaceColor;
+    if (!_RenderDisplayColorCase(opaqueSurface, &opaqueSurfaceColor)) {
+        return false;
+    }
+    if (!GfIsClose(opaqueSurfaceColor[3], 1.0f, 1.0e-5f)) {
+        std::printf("opaque surface reported partial coverage\n");
+        return false;
+    }
+
+    // The same surface at partial opacity transmits most of the camera
+    // throughput past itself, which must show up as partial coverage under a
+    // transparent clear and as no change at all under an opaque one.
+    _DisplayColorRenderCase transmissiveSurface = surfaceCase;
+    transmissiveSurface.materialOpacity = 0.25f;
+    transmissiveSurface.colorClearValue = transparentClear;
+    _DisplayColorRenderCase opaqueFilmTransmissive = transmissiveSurface;
+    opaqueFilmTransmissive.colorClearValue = opaqueClear;
+    GfVec4f transmissiveColor;
+    GfVec4f opaqueFilmColor;
+    if (!_RenderDisplayColorCase(transmissiveSurface, &transmissiveColor) ||
+        !_RenderDisplayColorCase(opaqueFilmTransmissive, &opaqueFilmColor)) {
+        return false;
+    }
+    if (transmissiveColor[3] >= opaqueSurfaceColor[3] ||
+        transmissiveColor[3] <= 0.0f) {
+        std::printf(
+            "transmissive surface did not report partial coverage (%f)\n",
+            transmissiveColor[3]);
+        return false;
+    }
+    if (!GfIsClose(opaqueFilmColor[3], 1.0f, 1.0e-5f)) {
+        std::printf("opaque film lost coverage through transmission\n");
         return false;
     }
 
@@ -1927,6 +2022,7 @@ main()
     TF_AXIOM(_TestLiveRenderPassesOwnAnonymousBindings());
     TF_AXIOM(_TestProcessGlobalDielectricSettingIsReapplied());
     TF_AXIOM(_TestDisplayColorFallbacks());
+    TF_AXIOM(_TestNonOpaqueFilmCoverage());
     TF_AXIOM(_TestAmbientOcclusionAov());
     TF_AXIOM(_TestCameraJitterTileDeterminism());
     TF_AXIOM(_TestRenderPassSettingsApplication());
