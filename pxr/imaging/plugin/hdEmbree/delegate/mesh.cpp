@@ -4,6 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026.
+//
 #include "mesh.h"
 #include "adaptiveSubdivision.h"
 #include "displacement.h"
@@ -1775,13 +1777,19 @@ HdEmbreeMesh::_UpdateInstances(HdSceneDelegate* sceneDelegate,
                                RTCDevice device)
 {
     std::vector<HdEmbreeInstanceData> instances;
+    HdEmbreeInstancer *instancer = nullptr;
     if (!GetInstancerId().IsEmpty()) {
-        // Retrieve instance transforms from the instancer.
+        // Retrieve instance transforms from the instancer. The lookup can
+        // return null: removing an instancer neither dirties the rprims that
+        // reference it nor clears their instancer id, so a mesh synced for an
+        // unrelated reason can still be carrying a stale id. Treat that as
+        // un-instanced rather than dereferencing null.
         HdRenderIndex &renderIndex = sceneDelegate->GetRenderIndex();
-        HdInstancer *instancer =
-            renderIndex.GetInstancer(GetInstancerId());
-        instances = static_cast<HdEmbreeInstancer*>(instancer)->
-            ComputeInstanceData(GetId());
+        instancer = static_cast<HdEmbreeInstancer*>(
+            renderIndex.GetInstancer(GetInstancerId()));
+    }
+    if (instancer) {
+        instances = instancer->ComputeInstanceData(GetId());
         for (HdEmbreeInstanceData& instance : instances) {
             ty::MergeCategories(
                 _categories, &instance.categories);
