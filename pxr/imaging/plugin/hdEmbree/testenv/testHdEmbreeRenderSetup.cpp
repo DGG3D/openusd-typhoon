@@ -4,6 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026.
+//
 #include <delegate/renderBuffer.h>
 #include <delegate/renderDelegate.h>
 #include <delegate/renderParam.h>

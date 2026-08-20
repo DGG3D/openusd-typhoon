@@ -4,6 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026.
+//
 #ifndef PXR_IMAGING_PLUGIN_HD_EMBREE_RENDERER_H
 #define PXR_IMAGING_PLUGIN_HD_EMBREE_RENDERER_H
 

@@ -1,3 +1,5 @@
+_Modified by DGG3D 2026._
+
 # hdEmbree Architecture
 
 This is the authoritative developer design for hdEmbree: dependency boundaries,

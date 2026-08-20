@@ -1,6 +1,8 @@
 //
 // hdEmbree random-walk SSS helpers.
 //
+// Modified by DGG3D 2026.
+//
 #include "sss.h"
 #include "medium.h"
 #include "transportPolicy.h"

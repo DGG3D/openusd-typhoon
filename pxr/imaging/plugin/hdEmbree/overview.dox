@@ -1,5 +1,7 @@
 // This is the sole hdEmbree Doxygen source. Hand-written plugin headers are
 // private implementation details and are not installed or indexed.
+//
+// Modified by DGG3D 2026.
 
 /*!
 \page hdEmbree_page_front Typhoon / hdEmbree Hydra renderer plugin

@@ -1,3 +1,5 @@
+_Modified by DGG3D 2026._
+
 ![Typhoon](doc/images/readme-header.png)
 
 # Typhoon

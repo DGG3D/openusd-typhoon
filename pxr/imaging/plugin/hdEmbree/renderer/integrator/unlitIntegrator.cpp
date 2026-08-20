@@ -4,6 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026.
+//
 // Single-hit Hydra display-color integration.
 
 #include <renderer/rayUtil.h>

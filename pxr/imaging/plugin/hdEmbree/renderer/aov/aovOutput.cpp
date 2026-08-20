@@ -4,6 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026.
+//
 // AOV validation, accumulation, dispatch, and hit outputs.
 
 #include <renderer/geometry/normalTransforms.h>
