@@ -4,6 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026.
+//
 #include "light.h"
 #include "light.h"
 #include "renderParam.h"
@@ -242,14 +244,24 @@ _LoadLightTexture(std::string const& path)
     int width = img->GetWidth();
     int height = img->GetHeight();
 
-    std::vector<GfVec3f> pixels(width * height);
+    // An image can open for reading and still report a degenerate size.
+    // Allocating from that leaves the buffer empty, and &pixels.front() on an
+    // empty vector is undefined, so reject it before it becomes a crash.
+    if (width <= 0 || height <= 0) {
+        TF_WARN("Image %s reports no pixels (%d x %d)",
+                path.c_str(), width, height);
+        return ty::LightTexture();
+    }
+
+    std::vector<GfVec3f> pixels(
+        static_cast<size_t>(width) * static_cast<size_t>(height));
 
     HioImage::StorageSpec storage;
     storage.width = width;
     storage.height = height;
     storage.depth = 1;
     storage.format = HioFormatFloat32Vec3;
-    storage.data = &pixels.front();
+    storage.data = pixels.data();
 
     if (img->Read(storage)) {
         ty::LightTexture texture;
