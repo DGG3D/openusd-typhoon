@@ -4,12 +4,20 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026: throttle the per-pass display resolve (with a
+// guaranteed final resolve) and mark single-sampled AOVs converged after
+// the first pass. Also: adaptive stopping is checkpointed and retires a
+// pixel only when its 3x3 neighbourhood agrees (_RetireAgreedAdaptivePixels).
+// Also: per-pass timing for a remaining-time estimate of the current frame
+// (_UpdateTimeEstimate, GetEstimatedSecondsRemaining); bookkeeping only.
+//
 // Frame orchestration and renderer configuration.
 
 #include "renderer.h"
 #include "rayUtil.h"
 #include "renderBuffer.h"
 
+#include <renderer/aov/adaptiveConvergence.h>
 #include <renderer/materials/MaterialXCpp/materials/bsdf.h>
 #include <renderer/materials/oiioTextureSystem.h>
 
@@ -258,6 +266,113 @@ ty::Renderer::GetAmbientOcclusionRayCount() const
     return _ambientOcclusionRayCount.load();
 }
 
+uint64_t
+ty::Renderer::GetConvergedPixelCount() const
+{
+    return _convergedPixelCount.load(std::memory_order_relaxed);
+}
+
+uint64_t
+ty::Renderer::GetTotalPixels() const
+{
+    return _totalPixelsInDataWindow.load(std::memory_order_relaxed);
+}
+
+uint64_t
+ty::Renderer::GetActivePixelCount() const
+{
+    const uint64_t total = GetTotalPixels();
+    const uint64_t converged = GetConvergedPixelCount();
+    return (converged < total) ? total - converged : 0;
+}
+
+double
+ty::Renderer::GetEstimatedSecondsRemaining() const
+{
+    // Same completion short-circuit as GetPercentDone().
+    if (_frameComplete.load(std::memory_order_relaxed)) {
+        return 0.0;
+    }
+    return _estimatedSecondsRemaining.load(std::memory_order_relaxed);
+}
+
+void
+ty::Renderer::_ResetTimeEstimate()
+{
+    std::lock_guard<std::mutex> lock(_timeEstimateMutex);
+    _adaptiveTimeEstimator.Reset();
+    _estimatedSecondsRemaining.store(-1.0, std::memory_order_relaxed);
+}
+
+void
+ty::Renderer::_UpdateTimeEstimate(
+    int completedPasses, uint64_t activeBeforePass, double passSeconds,
+    bool timed)
+{
+    const uint64_t activeAfterPass = GetActivePixelCount();
+    const int minSamples = _settings.minSamplesBeforeAdaptive;
+    std::lock_guard<std::mutex> lock(_timeEstimateMutex);
+    if (timed) {
+        _adaptiveTimeEstimator.RecordPass(activeBeforePass, passSeconds);
+    }
+    // Every active pixel now holds completedPasses samples, so this pass's
+    // sweep could only retire pixels if that count is a checkpoint.
+    if (completedPasses > 0 &&
+        ty::IsAdaptiveCheckpoint(
+            static_cast<uint32_t>(completedPasses), minSamples)) {
+        _adaptiveTimeEstimator.RecordCheckpointSurvival(
+            activeBeforePass, activeAfterPass);
+    }
+    _estimatedSecondsRemaining.store(
+        _adaptiveTimeEstimator.EstimateRemainingSeconds(
+            completedPasses, activeAfterPass,
+            _settings.samplesToConvergence, minSamples),
+        std::memory_order_relaxed);
+}
+
+double
+ty::Renderer::ComputePercentDone(
+    uint64_t convergedPixels,
+    uint64_t totalPixels,
+    int completedSamples,
+    int samplesToConvergence)
+{
+    // No pixels means the frame has not been set up yet (e.g. polled before
+    // the first _PreRenderSetup()), not that it is done: report 0. A finished
+    // frame is reported as 100 by GetPercentDone() via _frameComplete.
+    if (totalPixels == 0) {
+        return 0.0;
+    }
+    if (samplesToConvergence <= 0) {
+        return 100.0;
+    }
+    const double c =
+        static_cast<double>(std::min(convergedPixels, totalPixels)) /
+        static_cast<double>(totalPixels);
+    const double s = static_cast<double>(std::max(0, completedSamples));
+    const double n = static_cast<double>(samplesToConvergence);
+    const double sFraction = std::min(s / n, 1.0);
+    const double percent = 100.0 * (c + (1.0 - c) * sFraction);
+    return std::min(100.0, std::max(0.0, percent));
+}
+
+double
+ty::Renderer::GetPercentDone() const
+{
+    // Some exit paths finish the frame without every pixel satisfying
+    // adaptive convergence (for example, no multi-sampled AOVs left after
+    // the first pass); report 100 whenever the renderer considers the frame
+    // complete rather than relying on the formula alone.
+    if (_frameComplete.load(std::memory_order_relaxed)) {
+        return 100.0;
+    }
+    return ComputePercentDone(
+        GetConvergedPixelCount(),
+        GetTotalPixels(),
+        _completedSamples.load(std::memory_order_relaxed),
+        _settings.samplesToConvergence);
+}
+
 bool
 ty::Renderer::_PreRenderSetup()
 {
@@ -273,6 +388,13 @@ ty::Renderer::_PreRenderSetup()
     _colorClearValue = GfVec4f(0.0f);
     _aovOutputs.clear();
     _completedSamples.store(0);
+    // Frame-completion state is derived fresh by this Render() call; a
+    // previous frame's completion must not leak into GetPercentDone() while
+    // this one is still in progress.
+    _frameComplete.store(false, std::memory_order_relaxed);
+    // Modified by DGG3D 2026: the remaining-time estimate is per Render()
+    // call, like _completedSamples.
+    _ResetTimeEstimate();
     _sssCallCount.store(0);
     _sssSuccessCount.store(0);
     _sssWalkStepCount.store(0);
@@ -297,6 +419,9 @@ ty::Renderer::_PreRenderSetup()
         _pixelM2.clear();
         _pixelSampleCount.clear();
         _pixelConverged.clear();
+        _pixelAdaptivePass.clear();
+        _convergedPixelCount.store(0, std::memory_order_relaxed);
+        _totalPixelsInDataWindow.store(0, std::memory_order_relaxed);
 
         // Mark usable buffers converged so Hydra parks instead of retrying a
         // terminal setup failure.
@@ -323,7 +448,15 @@ ty::Renderer::_PreRenderSetup()
         _pixelMean.resize(numPixels, GfVec3f(0.0f));
         _pixelM2.resize(numPixels, GfVec3f(0.0f));
         _pixelSampleCount.resize(numPixels, 0);
-        _pixelConverged.resize(numPixels, false);
+        _pixelConverged.resize(numPixels, uint8_t(0));
+        _pixelAdaptivePass.resize(numPixels, uint8_t(0));
+
+        // Only pixels inside the data window are ever sampled or marked
+        // converged; it may be smaller than the full buffer resolution.
+        const uint64_t totalPixels =
+            static_cast<uint64_t>(_dataWindow.GetWidth()) *
+            static_cast<uint64_t>(_dataWindow.GetHeight());
+        _totalPixelsInDataWindow.store(totalPixels, std::memory_order_relaxed);
     }
 
     _ClassifyAovOutputs();
@@ -429,7 +562,12 @@ ty::Renderer::Render(HdRenderThread *renderThread)
             std::fill(
                 _pixelSampleCount.begin(), _pixelSampleCount.end(), 0);
             std::fill(
-                _pixelConverged.begin(), _pixelConverged.end(), false);
+                _pixelConverged.begin(), _pixelConverged.end(), uint8_t(0));
+            std::fill(
+                _pixelAdaptivePass.begin(), _pixelAdaptivePass.end(),
+                uint8_t(0));
+            _convergedPixelCount.store(0, std::memory_order_relaxed);
+            _ResetTimeEstimate();
         }
     }
 
@@ -437,6 +575,22 @@ ty::Renderer::Render(HdRenderThread *renderThread)
     // Each pass adds one sample per pixel.  After every pass we resolve
     // the accumulation buffer so the display shows progressively
     // improving quality.
+    //
+    // Modified by DGG3D 2026: Resolve() (see HdEmbreeRenderBuffer::Resolve)
+    // is now internally parallelized, but it still touches every pixel of
+    // every AOV under the framebuffer lock, which idles worker threads
+    // between passes. Throttle how often the in-loop resolve runs to about
+    // once per kResolveThrottleInterval, except for the first
+    // kAlwaysResolvePasses passes (so the viewport still updates promptly
+    // right after a render starts) — and always resolve once more,
+    // unconditionally, after the loop below exits, so the displayed image
+    // always reflects the last completed pass. Resolve() only recomputes
+    // averages from the accumulated sample buffers, so skipping
+    // intermediate resolves cannot change the final resolved pixel values.
+    static const int kAlwaysResolvePasses = 4;
+    static const std::chrono::milliseconds kResolveThrottleInterval(250);
+    auto lastResolveTime = std::chrono::steady_clock::now();
+
     bool renderFinished = false;
     for (int i = 0; i < _settings.samplesToConvergence; ++i) {
         // Pause point.
@@ -451,6 +605,11 @@ ty::Renderer::Render(HdRenderThread *renderThread)
             break;
         }
 
+        // Modified by DGG3D 2026: time the pass (after the pause point, so
+        // pausing is not counted) for the remaining-time estimate.
+        const auto passStartTime = std::chrono::steady_clock::now();
+        const uint64_t activeBeforePass = GetActivePixelCount();
+
         {
             HD_TRACE_SCOPE("ty::Renderer::TraceSamplePass");
             WorkParallelForN(numTilesX * numTilesY,
@@ -459,23 +618,50 @@ ty::Renderer::Render(HdRenderThread *renderThread)
                     std::placeholders::_1, std::placeholders::_2));
         }
 
+        // Modified by DGG3D 2026: adaptive retirement is a separate phase.
+        // The pass above only recorded, per pixel, whether it passed the
+        // convergence test at a checkpoint count; now that every tile has
+        // joined, retire the pixels whose whole in-window 3x3 neighbourhood
+        // passed, before the next pass decides which pixels to skip and
+        // before the all-converged check below. Skipped on cancellation,
+        // where some tiles may not have received this pass's sample.
+        if (!_pixelConverged.empty() && !renderThread->IsStopRequested()) {
+            HD_TRACE_SCOPE("ty::Renderer::RetireAgreedAdaptivePixels");
+            _RetireAgreedAdaptivePixels();
+        }
+
         // Resolve intermediate results so the viewport shows progressive
-        // refinement instead of staying blank until convergence.
+        // refinement instead of staying blank until convergence. Throttled;
+        // see the comment above this loop.
         {
-            HD_TRACE_SCOPE("ty::Renderer::ResolveSamplePass");
-            std::unique_lock<std::mutex> lock =
-                renderThread->LockFramebuffer();
-            for (size_t i = 0; i < _aovBindings.size(); ++i) {
-                ty::RenderBufferInterface *renderBuffer =
-                    dynamic_cast<ty::RenderBufferInterface*>(
-                        _aovBindings[i].renderBuffer);
-                renderBuffer->Resolve();
+            const auto now = std::chrono::steady_clock::now();
+            const bool shouldResolveThisPass =
+                (i < kAlwaysResolvePasses) ||
+                (now - lastResolveTime >= kResolveThrottleInterval);
+            if (shouldResolveThisPass) {
+                HD_TRACE_SCOPE("ty::Renderer::ResolveSamplePass");
+                std::unique_lock<std::mutex> lock =
+                    renderThread->LockFramebuffer();
+                for (size_t i = 0; i < _aovBindings.size(); ++i) {
+                    ty::RenderBufferInterface *renderBuffer =
+                        dynamic_cast<ty::RenderBufferInterface*>(
+                            _aovBindings[i].renderBuffer);
+                    renderBuffer->Resolve();
+                }
+                lastResolveTime = now;
             }
         }
 
-        // After the first pass, mark the single-sampled attachments as
-        // converged and unmap them. If there are no multisampled attachments,
-        // we are done.
+        // After the first pass, mark the single-sampled attachments (depth,
+        // primId, normal, ...) as converged. This is checked by the
+        // IsConverged() gate in _EvaluatePixelSample, so they stop being
+        // written to on later passes and simply keep this first pass's
+        // value instead of being repeatedly overwritten by every later
+        // pass (each of which may sample a slightly different sub-pixel
+        // jitter position). Actually unmapping them is left to the
+        // FinalizeAovs step below, alongside the multisampled attachments,
+        // to keep exactly one Map()/Unmap() pair per buffer per frame.
+        // If there are no multisampled attachments, we are done.
         if (i == 0) {
             bool moreWork = false;
             for (size_t i = 0; i < _aovBindings.size(); ++i) {
@@ -484,6 +670,8 @@ ty::Renderer::Render(HdRenderThread *renderThread)
                         _aovBindings[i].renderBuffer);
                 if (renderBuffer->IsMultiSampled()) {
                     moreWork = true;
+                } else {
+                    renderBuffer->SetConverged(true);
                 }
             }
             if (!moreWork) {
@@ -514,6 +702,18 @@ ty::Renderer::Render(HdRenderThread *renderThread)
             }
         }
 
+        // Modified by DGG3D 2026: feed the remaining-time estimate. A pass
+        // cut short by a stop request is not representative and is skipped.
+        // The first pass is not used for the pass-time fit: it carries
+        // one-off warm-up costs (texture and cache population, the
+        // single-sampled AOVs) that later passes do not repeat.
+        if (!renderThread->IsStopRequested()) {
+            const double passSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - passStartTime).count();
+            _UpdateTimeEstimate(
+                i + 1, activeBeforePass, passSeconds, /*timed=*/i > 0);
+        }
+
         // Cancellation point.
         if (renderThread->IsStopRequested()) {
             break;
@@ -522,6 +722,28 @@ ty::Renderer::Render(HdRenderThread *renderThread)
         // If this is the last iteration, rendering completed naturally.
         if (i == _settings.samplesToConvergence - 1) {
             renderFinished = true;
+        }
+    }
+
+    // GetPercentDone() reports 100 once the frame is complete, regardless
+    // of which exit path above reached that state (for example, no
+    // multi-sampled AOVs left after the first pass, not just every pixel
+    // satisfying adaptive convergence).
+    _frameComplete.store(renderFinished, std::memory_order_relaxed);
+
+    // Unconditional final resolve: the in-loop resolve above is throttled,
+    // so the last completed pass may not have been resolved into the
+    // display buffer yet. Always resolve once more here, however the loop
+    // exited (converged, stopped, or sample cap), so the final image is
+    // always up to date with the last pass that was actually rendered.
+    {
+        HD_TRACE_SCOPE("ty::Renderer::FinalResolve");
+        std::unique_lock<std::mutex> lock = renderThread->LockFramebuffer();
+        for (size_t i = 0; i < _aovBindings.size(); ++i) {
+            ty::RenderBufferInterface *renderBuffer =
+                dynamic_cast<ty::RenderBufferInterface*>(
+                    _aovBindings[i].renderBuffer);
+            renderBuffer->Resolve();
         }
     }
 
@@ -624,6 +846,60 @@ ty::Renderer::Render(HdRenderThread *renderThread)
         std::printf("======================================\n");
         std::fflush(stdout);
     }
+}
+
+// Modified by DGG3D 2026: new. See the declaration in renderer.h and
+// renderer/aov/adaptiveConvergence.h.
+void
+ty::Renderer::_RetireAgreedAdaptivePixels()
+{
+    if (_pixelConverged.empty() ||
+        _pixelAdaptivePass.size() != _pixelConverged.size() ||
+        _pixelSampleCount.size() != _pixelConverged.size() ||
+        _width == 0 || _height == 0) {
+        return;
+    }
+
+    // Same buffer-space data window as _RenderTiles: the data window is
+    // y-down but the image rows are bottom-to-top, so flip it. Clamped to
+    // the buffer so neighbour lookups can never leave it.
+    unsigned int minY = _dataWindow.GetMinY();
+    unsigned int maxY = _dataWindow.GetMaxY() + 1;
+    std::swap(minY, maxY);
+    minY = _height - minY;
+    maxY = _height - maxY;
+
+    ty::AdaptiveWindow window;
+    window.minX = std::min(
+        static_cast<unsigned int>(_dataWindow.GetMinX()), _width);
+    window.maxX = std::min(
+        static_cast<unsigned int>(_dataWindow.GetMaxX() + 1), _width);
+    window.minY = std::min(minY, _height);
+    window.maxY = std::min(maxY, _height);
+    if (window.minX >= window.maxX || window.minY >= window.maxY) {
+        return;
+    }
+
+    const int minSamples = _settings.minSamplesBeforeAdaptive;
+    // Each worker reads only pass flags / sample counts (not written during
+    // this sweep) and writes only _pixelConverged entries of its own rows,
+    // so the retirement decision is independent of sweep order.
+    WorkParallelForN(window.maxY - window.minY,
+        [this, &window, minSamples](size_t rowBegin, size_t rowEnd) {
+            const uint64_t retired = ty::RetireAgreedAdaptivePixels(
+                _pixelAdaptivePass.data(),
+                _pixelSampleCount.data(),
+                _pixelConverged.data(),
+                _width,
+                window,
+                minSamples,
+                window.minY + static_cast<unsigned int>(rowBegin),
+                window.minY + static_cast<unsigned int>(rowEnd));
+            if (retired != 0) {
+                _convergedPixelCount.fetch_add(
+                    retired, std::memory_order_relaxed);
+            }
+        });
 }
 
 void

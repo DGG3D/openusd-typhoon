@@ -4,6 +4,10 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026: only keep the backface-cull intersection filter
+// attached to the Embree geometry while the current cull style can
+// actually reject a hit (see _UpdateCullFilter()).
+//
 #ifndef PXR_IMAGING_PLUGIN_HD_EMBREE_MESH_H
 #define PXR_IMAGING_PLUGIN_HD_EMBREE_MESH_H
 
@@ -307,6 +311,12 @@ private:
 
     // An embree intersection filter callback, for doing backface culling.
     static void _EmbreeCullFaces(const RTCFilterFunctionNArguments* args);
+
+    // Modified by DGG3D 2026: (re-)attach or detach _EmbreeCullFaces on
+    // _geometry based on whether _cullStyle can currently reject a hit
+    // (i.e. is not HdCullStyleDontCare), instead of always attaching it.
+    // No-op if _geometry hasn't been created yet.
+    void _UpdateCullFilter();
 
 private:
     // Every HdEmbreeMesh is treated as instanced; if there's no instancer,

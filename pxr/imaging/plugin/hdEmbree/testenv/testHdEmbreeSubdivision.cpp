@@ -4,6 +4,10 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026: add
+// TestCullStyleChangeReattachesFilterWithoutTopologyRebuild, covering
+// HdEmbreeMesh::_UpdateCullFilter().
+//
 #include <delegate/adaptiveSubdivision.h>
 #include <delegate/displacement.h>
 #include <delegate/material.h>
@@ -2796,6 +2800,98 @@ TestMirroredInstancePreservesBackfaceCulling()
     return valid;
 }
 
+// Modified by DGG3D 2026: the backface-cull filter used to be attached to
+// every mesh's Embree geometry unconditionally, even when the cull style
+// (HdCullStyleDontCare, the default) can never reject a hit. It is now
+// (re-)attached or detached in HdEmbreeMesh::_UpdateCullFilter() based on
+// the current cull style, on every sync (not just when the mesh geometry
+// itself is rebuilt). This test drives a cull-style-only dirty (no
+// topology change) both ways, to prove the filter is actually toggled and
+// not left stuck from whatever it was at mesh creation.
+bool
+TestCullStyleChangeReattachesFilterWithoutTopologyRebuild()
+{
+    _EmbreeTestContext context;
+    HdRenderDelegate* const renderDelegate = context.renderDelegate;
+    HdRenderIndex* const renderIndex = context.renderIndex.get();
+    if (!renderDelegate || !renderIndex) {
+        return false;
+    }
+
+    HdUnitTestDelegate delegate(
+        renderIndex, SdfPath::AbsoluteRootPath());
+    const SdfPath meshId("/cullToggleTriangle");
+    delegate.AddMesh(
+        meshId, GfMatrix4f(1.0f),
+        VtVec3fArray{
+            GfVec3f(0.0f, 0.0f, 0.0f),
+            GfVec3f(1.0f, 0.0f, 0.0f),
+            GfVec3f(0.0f, 1.0f, 0.0f)},
+        VtIntArray{3}, VtIntArray{0, 1, 2},
+        false, SdfPath());
+    delegate.SetRefineLevel(meshId, 0);
+    // Cull style starts at the default (HdCullStyleDontCare).
+
+    HdRprim* const mesh =
+        const_cast<HdRprim*>(renderIndex->GetRprim(meshId));
+    HdDirtyBits meshBits = mesh->GetInitialDirtyBitsMask();
+    mesh->InitRepr(&delegate, HdReprTokens->refined, &meshBits);
+    mesh->Sync(
+        &delegate, renderDelegate->GetRenderParam(),
+        &meshBits, HdReprTokens->refined);
+
+    RTCScene const root = static_cast<HdEmbreeRenderParam*>(
+        renderDelegate->GetRenderParam())->AcquireSceneForEdit();
+    rtcCommitScene(root);
+
+    const auto hitsFromBelow = [&]() {
+        RTCRayHit rayHit{};
+        rayHit.ray.org_x = 1.0f / 3.0f;
+        rayHit.ray.org_y = 1.0f / 3.0f;
+        rayHit.ray.org_z = -2.0f;
+        rayHit.ray.dir_z = 1.0f;
+        rayHit.ray.tnear = 0.0f;
+        rayHit.ray.tfar = 4.0f;
+        rayHit.ray.mask = 0xffffffffu;
+        rayHit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        rtcIntersect1(root, &rayHit);
+        return rayHit.hit.geomID != RTC_INVALID_GEOMETRY_ID;
+    };
+
+    const bool hitsWithDontCare = hitsFromBelow();
+
+    // Flip to HdCullStyleBack via a cull-style-only dirty bit: no topology
+    // change, so the mesh geometry is not rebuilt, and the only path that
+    // can pick this up is _UpdateCullFilter() re-attaching the filter.
+    delegate.SetMeshCullStyle(meshId, HdCullStyleBack);
+    meshBits = HdChangeTracker::DirtyCullStyle;
+    mesh->Sync(
+        &delegate, renderDelegate->GetRenderParam(),
+        &meshBits, HdReprTokens->refined);
+    rtcCommitScene(root);
+    const bool hitsWithBackCull = hitsFromBelow();
+
+    // Flip back to HdCullStyleDontCare; the filter must be detached again
+    // so the back face is visible once more.
+    delegate.SetMeshCullStyle(meshId, HdCullStyleDontCare);
+    meshBits = HdChangeTracker::DirtyCullStyle;
+    mesh->Sync(
+        &delegate, renderDelegate->GetRenderParam(),
+        &meshBits, HdReprTokens->refined);
+    rtcCommitScene(root);
+    const bool hitsAfterRevertToDontCare = hitsFromBelow();
+
+    const bool valid = hitsWithDontCare && !hitsWithBackCull &&
+        hitsAfterRevertToDontCare;
+    if (!valid) {
+        std::printf(
+            "    cull filter toggle hits: dontCare=%d back=%d "
+            "revertedDontCare=%d\n",
+            hitsWithDontCare, hitsWithBackCull, hitsAfterRevertToDontCare);
+    }
+    return valid;
+}
+
 bool
 _AllInstanceCentersHit(
     RTCScene scene, size_t instanceCount, float spacing,
@@ -3669,6 +3765,8 @@ main()
          &TestProductionVertexBufferHasFloat3PaddingAndUpdates},
         {"Subdivision.TestMirroredInstancePreservesBackfaceCulling",
          &TestMirroredInstancePreservesBackfaceCulling},
+        {"Subdivision.TestCullStyleChangeReattachesFilterWithoutTopologyRebuild",
+         &TestCullStyleChangeReattachesFilterWithoutTopologyRebuild},
         {"Subdivision.TestPrototypeSceneChangesRecommitAllInstances",
          &TestPrototypeSceneChangesRecommitAllInstances},
         {"Subdivision.TestSubdivisionPrimvarsUseHydraInterpolationModes",

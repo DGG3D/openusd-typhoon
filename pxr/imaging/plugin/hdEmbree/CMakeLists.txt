@@ -152,6 +152,8 @@ pxr_plugin(hdEmbree
 
     PRIVATE_HEADERS
         renderer/api.h
+        renderer/aov/adaptiveConvergence.h
+        renderer/aov/adaptiveTimeEstimate.h
         renderer/colorManagement.h
         renderer/heroWavelength.h
         renderer/rayUtil.h
@@ -210,6 +212,34 @@ target_include_directories(hdEmbree
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
 )
 
+# Modified by DGG3D 2026: regenerate hdEmbreeBuildInfo.h (the git commit
+# hdEmbree was built from) on every build, not just at configure time, so
+# GetRenderStats()/the delegate's startup log always reflect the commit that
+# is actually about to be compiled. Runs as a custom target with no tracked
+# inputs, which CMake/Ninja/MSBuild always re-invoke; the script itself only
+# rewrites the header when its content changes, so an unchanged commit does
+# not force a recompile. The dirty flag is computed from `git status
+# --porcelain` over the whole repo (CMAKE_SOURCE_DIR) rather than just this
+# plugin directory -- simpler to reason about, and still useful signal for a
+# dev build. Works with the multi-config Visual Studio generator because the
+# output header lives in CMAKE_CURRENT_BINARY_DIR, which (unlike the
+# per-config target output dir) is the same for every configuration.
+set(_hdEmbree_buildInfoHeader "${CMAKE_CURRENT_BINARY_DIR}/hdEmbreeBuildInfo.h")
+add_custom_target(hdEmbree_buildInfo ALL
+    COMMAND "${CMAKE_COMMAND}"
+        "-DHDEMBREE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DHDEMBREE_OUTPUT_HEADER=${_hdEmbree_buildInfoHeader}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hdEmbreeBuildInfo.cmake"
+    BYPRODUCTS "${_hdEmbree_buildInfoHeader}"
+    COMMENT "hdEmbree: writing build info header (git commit)"
+    VERBATIM
+)
+add_dependencies(hdEmbree hdEmbree_buildInfo)
+target_include_directories(hdEmbree
+    PRIVATE
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>"
+)
+
 if (WIN32)
     # Tests link private plugin symbols, which Windows does not export by default.
     set_target_properties(hdEmbree PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
@@ -262,6 +292,24 @@ pxr_build_test(testHdEmbreeSampling
 
 pxr_register_test(testHdEmbreeSampling
     COMMAND "${CMAKE_INSTALL_PREFIX}/tests/testHdEmbreeSampling"
+    EXPECTED_RETURN_CODE 0
+)
+
+# Modified by DGG3D 2026: unit and statistical regression tests for the
+# checkpointed, neighbourhood-agreed adaptive stopping rule. The logic under
+# test is header-only (renderer/aov/adaptiveConvergence.h), so the test does
+# not link hdEmbree. Also covers the header-only remaining-time estimator
+# (renderer/aov/adaptiveTimeEstimate.h, added to PRIVATE_HEADERS above).
+pxr_build_test(testHdEmbreeAdaptiveConvergence
+    LIBRARIES
+        gf
+        tf
+    CPPFILES
+        testenv/testHdEmbreeAdaptiveConvergence.cpp
+)
+
+pxr_register_test(testHdEmbreeAdaptiveConvergence
+    COMMAND "${CMAKE_INSTALL_PREFIX}/tests/testHdEmbreeAdaptiveConvergence"
     EXPECTED_RETURN_CODE 0
 )
 

@@ -1,6 +1,10 @@
 //
 // MaterialXCpp evaluation graph — pxr-independent.
 //
+// Modified by DGG3D 2026: cache the terminal material model as an enum
+// classified once at compile time, instead of re-deriving it by string
+// comparison on every Evaluate()/EvaluateDisplacement() call.
+//
 #ifndef MXCPP_GRAPH_H
 #define MXCPP_GRAPH_H
 
@@ -132,18 +136,62 @@ private:
         ParamMap terminalParams;
     };
 
+    /// The classified terminal model type. Computed once from the node-type
+    /// id string when the graph is compiled (see Compile()); the per-pixel
+    /// evaluation path dispatches on this instead of comparing strings.
+    enum class MaterialModelType {
+        Unknown,
+        SurfaceVolumeMaterial,
+        StandardSurface,
+        OpenPbr,
+        DisneyPrincipled,
+        GltfPbr,
+        UsdPreviewSurface,
+        SurfaceConstructor,
+        SurfaceUnlit,
+        VolumeConstructor,
+        MixVolumeShader,
+        MixSurfaceShader,
+        DotSurfaceShader,
+        ConvertFloatSurfaceShader,
+        ConvertIntegerSurfaceShader,
+        ConvertBooleanSurfaceShader,
+        ConvertColorOrVector3SurfaceShader,
+        ConvertColorOrVector4SurfaceShader,
+        ConvertVector2SurfaceShader,
+        DisplacementFloat,
+    };
+
     std::vector<CompiledNode> _nodes;
     std::vector<InputBinding> _terminalInputs;
     std::string _materialModelType;
+    MaterialModelType _materialModelEnum = MaterialModelType::Unknown;
     bool _isValid = false;
     bool _requiresObjectSpacePosition = false;
 
+    /// Classify a terminal node-type id string into a MaterialModelType.
+    /// Called once per compiled graph.
+    static MaterialModelType _ClassifyMaterialModel(
+        const std::string& modelType);
+
     /// Evaluate one supported terminal model into \p closure. A null closure
-    /// performs the same dispatch lookup without evaluating the model.
+    /// performs the same dispatch lookup without evaluating the model. Used
+    /// at compile time, where the node-type id is only available as a
+    /// string.
     ///
     /// Returns false when \p modelType has no terminal-model evaluator.
     static bool _EvalMaterialModel(
         const std::string& modelType,
+        const ParamMap& params,
+        const EvalOptions& options,
+        SurfaceClosure* closure);
+
+    /// Same dispatch as above, keyed on an already-classified
+    /// MaterialModelType. This is the hot-path overload used by Evaluate()
+    /// and EvaluateDisplacement(), which read the type cached in
+    /// _materialModelEnum instead of re-classifying a string every call.
+    static bool _EvalMaterialModel(
+        MaterialModelType modelType,
         const ParamMap& params,
         const EvalOptions& options,
         SurfaceClosure* closure);

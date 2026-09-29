@@ -4,6 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026: add a smoke test for GetRenderStats()['buildCommit'].
+//
 #include <delegate/renderBuffer.h>
 #include <delegate/renderDelegate.h>
 #include <renderer/colorManagement.h>
@@ -90,6 +92,27 @@ _HasSettingValue(VtDictionary const& settings,
     if (it->second.UncheckedGet<T>() != expectedValue) {
         std::printf("unexpected value for namespaced setting: %s\n",
                     key.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+// Modified by DGG3D 2026: cheap smoke test that GetRenderStats() reports a
+// non-empty build commit string.
+bool
+_TestBuildCommitStat()
+{
+    HdEmbreeRenderDelegate delegate;
+
+    const VtDictionary stats = delegate.GetRenderStats();
+    const VtDictionary::const_iterator it = stats.find("buildCommit");
+    if (it == stats.end() || !it->second.IsHolding<std::string>()) {
+        std::printf("GetRenderStats() is missing a string 'buildCommit'\n");
+        return false;
+    }
+    if (it->second.UncheckedGet<std::string>().empty()) {
+        std::printf("GetRenderStats()['buildCommit'] is empty\n");
         return false;
     }
 
@@ -1212,6 +1235,9 @@ int
 main()
 {
     if (!_TestColorManagementUtilities()) {
+        return 1;
+    }
+    if (!_TestBuildCommitStat()) {
         return 1;
     }
     if (!_TestRenderDelegateSettings()) {

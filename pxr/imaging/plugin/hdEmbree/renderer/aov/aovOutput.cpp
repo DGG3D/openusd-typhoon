@@ -4,10 +4,13 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
-// Modified by DGG3D 2026.
+// Modified by DGG3D 2026. Also: adaptive stopping is checkpointed and
+// requires 3x3 neighbourhood agreement (renderer/aov/adaptiveConvergence.h).
+// Also: Clear() and ResetAccumulation() reset the remaining-time estimate.
 //
 // AOV validation, accumulation, dispatch, and hit outputs.
 
+#include <renderer/aov/adaptiveConvergence.h>
 #include <renderer/geometry/normalTransforms.h>
 #include <renderer/geometry/surfaceDerivatives.h>
 #include <renderer/rayUtil.h>
@@ -29,29 +32,6 @@ PXR_NAMESPACE_OPEN_SCOPE
 
 namespace
 {
-
-constexpr float _kAdaptiveAbsoluteStdError = 0.001f;
-constexpr float _kAdaptiveAbsoluteVarianceOfMean =
-    _kAdaptiveAbsoluteStdError * _kAdaptiveAbsoluteStdError;
-
-bool
-_IsPerChannelVarianceConverged(
-    GfVec3f const& varOfMean,
-    GfVec3f const& mean,
-    float relativeVarianceThreshold)
-{
-    const float threshold = std::max(0.0f, relativeVarianceThreshold);
-    for (int c = 0; c < 3; ++c) {
-        const float meanMagnitude = std::abs(mean[c]);
-        const float varianceLimit =
-            _kAdaptiveAbsoluteVarianceOfMean
-            + threshold * meanMagnitude * meanMagnitude;
-        if (varOfMean[c] > varianceLimit) {
-            return false;
-        }
-    }
-    return true;
-}
 
 // Returns false if the hit has no valid instance/prototype context.
 // Outputs are written only on success.
@@ -400,7 +380,11 @@ ty::Renderer::Clear()
     std::fill(_pixelMean.begin(), _pixelMean.end(), GfVec3f(0.0f));
     std::fill(_pixelM2.begin(), _pixelM2.end(), GfVec3f(0.0f));
     std::fill(_pixelSampleCount.begin(), _pixelSampleCount.end(), 0);
-    std::fill(_pixelConverged.begin(), _pixelConverged.end(), false);
+    std::fill(_pixelConverged.begin(), _pixelConverged.end(), uint8_t(0));
+    std::fill(
+        _pixelAdaptivePass.begin(), _pixelAdaptivePass.end(), uint8_t(0));
+    _convergedPixelCount.store(0, std::memory_order_relaxed);
+    _ResetTimeEstimate();
 }
 
 void
@@ -427,7 +411,11 @@ ty::Renderer::ResetAccumulation()
     std::fill(_pixelMean.begin(), _pixelMean.end(), GfVec3f(0.0f));
     std::fill(_pixelM2.begin(), _pixelM2.end(), GfVec3f(0.0f));
     std::fill(_pixelSampleCount.begin(), _pixelSampleCount.end(), 0);
-    std::fill(_pixelConverged.begin(), _pixelConverged.end(), false);
+    std::fill(_pixelConverged.begin(), _pixelConverged.end(), uint8_t(0));
+    std::fill(
+        _pixelAdaptivePass.begin(), _pixelAdaptivePass.end(), uint8_t(0));
+    _convergedPixelCount.store(0, std::memory_order_relaxed);
+    _ResetTimeEstimate();
 }
 
 void
@@ -626,21 +614,19 @@ ty::Renderer::_UpdateVariance(
     GfVec3f const& rgb)
 {
     const size_t idx = y * _width + x;
-    uint32_t count = ++_pixelSampleCount[idx];
-    GfVec3f delta = rgb - _pixelMean[idx];
-    _pixelMean[idx] += delta / static_cast<float>(count);
-    GfVec3f delta2 = rgb - _pixelMean[idx];
-    _pixelM2[idx] += GfCompMult(delta, delta2);
-
-    if (count >= static_cast<uint32_t>(_settings.minSamplesBeforeAdaptive)) {
-        float fCount = static_cast<float>(count);
-        GfVec3f varOfMean = _pixelM2[idx] / (fCount * fCount);
-        const GfVec3f &mean = _pixelMean[idx];
-        if (_IsPerChannelVarianceConverged(
-                varOfMean, mean, _settings.adaptiveThreshold)) {
-            _pixelConverged[idx] = true;
-        }
-    }
+    // Modified by DGG3D 2026: the Welford update and the variance test are
+    // unchanged, but the test now only runs at checkpoint counts
+    // (minSamplesBeforeAdaptive * 2^k) and only records a pass flag here.
+    // Retirement (_pixelConverged, _convergedPixelCount) happens between
+    // passes in _RetireAgreedAdaptivePixels(), which also requires all
+    // in-window 8-neighbours to pass. idx is exclusive to this worker thread
+    // for the current pass; uint8_t elements (unlike vector<bool>'s packed
+    // bits) give each pixel its own byte, so concurrent stores to
+    // neighbouring flags cannot race.
+    ty::UpdateAdaptivePixel(
+        &_pixelMean[idx], &_pixelM2[idx], &_pixelSampleCount[idx],
+        &_pixelAdaptivePass[idx], rgb,
+        _settings.minSamplesBeforeAdaptive, _settings.adaptiveThreshold);
 }
 
 bool

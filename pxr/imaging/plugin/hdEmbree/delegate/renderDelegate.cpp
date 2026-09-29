@@ -4,6 +4,11 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026: report the build's git commit (hdEmbreeBuildInfo.h,
+// generated at build time) via GetRenderStats()["buildCommit"] and print it
+// once per delegate instantiation. Also: report "activePixels" and a
+// remaining-time estimate ("estimatedSecondsRemaining") for the current frame.
+//
 #include "renderDelegate.h"
 #include "instancer.h"
 #include "light.h"
@@ -14,6 +19,11 @@
 
 #include <renderer/renderSettings.h>
 
+// Generated at build time (see CMakeLists.txt / cmake/hdEmbreeBuildInfo.cmake).
+// Kept confined to this .cpp so the rest of the plugin does not depend on
+// the generated-header include path.
+#include "hdEmbreeBuildInfo.h"
+
 #include "pxr/base/gf/colorSpace.h"
 #include "pxr/base/tf/diagnostic.h"
 #include "pxr/imaging/hd/bprim.h"
@@ -23,6 +33,7 @@
 #include "pxr/imaging/hd/tokens.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 
 PXR_NAMESPACE_OPEN_SCOPE
@@ -130,6 +141,13 @@ HdEmbreeRenderDelegate::HdEmbreeRenderDelegate(
 void
 HdEmbreeRenderDelegate::_Initialize()
 {
+    // Modified by DGG3D 2026: announce the build commit once per delegate
+    // instantiation, so it reliably shows in the host app's console. Covers
+    // both constructor overloads, which both call through here.
+    std::printf(
+        "hdEmbree (Typhoon) - DGG Fork - Build: %s\n", HDEMBREE_BUILD_COMMIT);
+    std::fflush(stdout);
+
     // Initialize the settings and settings descriptors.
     const ty::RenderSettings defaults;
     _settingDescriptors = {
@@ -402,6 +420,22 @@ HdEmbreeRenderDelegate::GetRenderStats() const
     stats["sssAvgStepsPerSuccess"] = (sssSuccesses > 0)
         ? static_cast<double>(sssWalkSteps) / static_cast<double>(sssSuccesses)
         : 0.0;
+
+    stats["convergedPixels"] =
+        static_cast<int64_t>(_renderer.GetConvergedPixelCount());
+    stats["totalPixels"] =
+        static_cast<int64_t>(_renderer.GetTotalPixels());
+    stats["samplesToConvergence"] =
+        static_cast<int64_t>(_renderer.GetRenderSettings().samplesToConvergence);
+    stats["percentDone"] = _renderer.GetPercentDone();
+    // Data-window pixels not yet retired by adaptive sampling.
+    stats["activePixels"] =
+        static_cast<int64_t>(_renderer.GetActivePixelCount());
+    // Seconds until the current frame completes; negative while unknown
+    // (too few passes timed), 0 once complete.
+    stats["estimatedSecondsRemaining"] =
+        _renderer.GetEstimatedSecondsRemaining();
+    stats["buildCommit"] = std::string(HDEMBREE_BUILD_COMMIT);
     return stats;
 }
 

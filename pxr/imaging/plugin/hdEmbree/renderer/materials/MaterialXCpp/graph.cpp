@@ -1,6 +1,11 @@
 //
 // MaterialXCpp evaluation graph — pxr-independent.
 //
+// Modified by DGG3D 2026: cache the terminal material model as an enum
+// classified once at compile time (_ClassifyMaterialModel /
+// _materialModelEnum), instead of re-deriving it by string comparison on
+// every Evaluate()/EvaluateDisplacement() call.
+//
 #include "graph.h"
 #include "paramMap.h"
 #include "surfaceShaderUtils.h"
@@ -549,6 +554,11 @@ EvalGraph::Compile(
 
     std::unique_ptr<EvalGraph> graph = std::make_unique<EvalGraph>();
     graph->_materialModelType = termNodeIt->second.nodeTypeId;
+    // Classify the terminal model type once here, at compile time, so
+    // Evaluate()/EvaluateDisplacement() can dispatch on the cached enum
+    // instead of re-comparing strings on every call.
+    graph->_materialModelEnum =
+        EvalGraph::_ClassifyMaterialModel(graph->_materialModelType);
 
     // ---- Gather reachable nodes via DFS topological sort ----
 
@@ -954,7 +964,7 @@ EvalGraph::Evaluate(const ShadingContext& ctx, const EvalOptions& options) const
 
     SurfaceClosure closure;
     if (!_EvalMaterialModel(
-            _materialModelType, terminalParams, options, &closure)) {
+            _materialModelEnum, terminalParams, options, &closure)) {
         return SurfaceClosure();
     }
     closure.luminanceCoefficients = ctx.luminanceCoefficients;
@@ -967,7 +977,8 @@ EvalGraph::EvaluateDisplacement(
     const ShadingContext& ctx,
     float* displacement) const
 {
-    if (!_isValid || _materialModelType != _kDisplacementFloat ||
+    if (!_isValid ||
+        _materialModelEnum != MaterialModelType::DisplacementFloat ||
         !displacement) {
         return false;
     }
@@ -997,6 +1008,78 @@ EvalGraph::EvaluateDisplacement(
 // Material model dispatch
 // ---------------------------------------------------------------------------
 
+// Modified by DGG3D 2026: classification is a one-time, compile-time string
+// comparison chain (this function). The hot per-evaluation path below
+// (the MaterialModelType overload of _EvalMaterialModel) switches on the
+// already-classified enum instead.
+/* static */
+EvalGraph::MaterialModelType
+EvalGraph::_ClassifyMaterialModel(const std::string& modelType)
+{
+    if (modelType == _kSurfaceVolumeMaterial) {
+        return MaterialModelType::SurfaceVolumeMaterial;
+    }
+    if (modelType == _kStandardSurface) {
+        return MaterialModelType::StandardSurface;
+    }
+    if (modelType == _kOpenPbr) {
+        return MaterialModelType::OpenPbr;
+    }
+    if (modelType == _kDisneyPrincipled) {
+        return MaterialModelType::DisneyPrincipled;
+    }
+    if (modelType == _kGltfPbr) {
+        return MaterialModelType::GltfPbr;
+    }
+    if (modelType == _kUsdPreviewSurface ||
+        modelType == _kMaterialXUsdPreviewSurface) {
+        return MaterialModelType::UsdPreviewSurface;
+    }
+    if (modelType == _kSurfaceConstructor) {
+        return MaterialModelType::SurfaceConstructor;
+    }
+    if (modelType == _kSurfaceUnlit) {
+        return MaterialModelType::SurfaceUnlit;
+    }
+    if (modelType == _kVolumeConstructor) {
+        return MaterialModelType::VolumeConstructor;
+    }
+    if (modelType == _kMixVolumeShader) {
+        return MaterialModelType::MixVolumeShader;
+    }
+    if (modelType == _kMixSurfaceShader) {
+        return MaterialModelType::MixSurfaceShader;
+    }
+    if (modelType == _kDotSurfaceShader) {
+        return MaterialModelType::DotSurfaceShader;
+    }
+    if (modelType == _kConvertFloatSurfaceShader) {
+        return MaterialModelType::ConvertFloatSurfaceShader;
+    }
+    if (modelType == _kConvertIntegerSurfaceShader) {
+        return MaterialModelType::ConvertIntegerSurfaceShader;
+    }
+    if (modelType == _kConvertBooleanSurfaceShader) {
+        return MaterialModelType::ConvertBooleanSurfaceShader;
+    }
+    if (modelType == _kConvertColor3SurfaceShader ||
+        modelType == _kConvertVector3SurfaceShader) {
+        return MaterialModelType::ConvertColorOrVector3SurfaceShader;
+    }
+    if (modelType == _kConvertColor4SurfaceShader ||
+        modelType == _kConvertVector4SurfaceShader) {
+        return MaterialModelType::ConvertColorOrVector4SurfaceShader;
+    }
+    if (modelType == _kConvertVector2SurfaceShader) {
+        return MaterialModelType::ConvertVector2SurfaceShader;
+    }
+    if (modelType == _kDisplacementFloat) {
+        return MaterialModelType::DisplacementFloat;
+    }
+
+    return MaterialModelType::Unknown;
+}
+
 /* static */
 bool
 EvalGraph::_EvalMaterialModel(
@@ -1005,19 +1088,30 @@ EvalGraph::_EvalMaterialModel(
     const EvalOptions& options,
     SurfaceClosure* closure)
 {
-    if (modelType == _kSurfaceVolumeMaterial) {
+    return _EvalMaterialModel(
+        _ClassifyMaterialModel(modelType), params, options, closure);
+}
+
+/* static */
+bool
+EvalGraph::_EvalMaterialModel(
+    MaterialModelType modelType,
+    const ParamMap& params,
+    const EvalOptions& options,
+    SurfaceClosure* closure)
+{
+    switch (modelType) {
+    case MaterialModelType::SurfaceVolumeMaterial:
         if (closure) {
             *closure = EvalSurfaceVolumeMaterial(params);
         }
         return true;
-    }
-    if (modelType == _kStandardSurface) {
+    case MaterialModelType::StandardSurface:
         if (closure) {
             *closure = EvalStandardSurface(params);
         }
         return true;
-    }
-    if (modelType == _kOpenPbr) {
+    case MaterialModelType::OpenPbr:
         if (closure) {
             if (options.useAdobeOpenPBR) {
                 *closure = options.visibilityOnly
@@ -1028,56 +1122,42 @@ EvalGraph::_EvalMaterialModel(
             }
         }
         return true;
-    }
-    if (modelType == _kDisneyPrincipled) {
+    case MaterialModelType::DisneyPrincipled:
         if (closure) {
             *closure = EvalDisneyPrincipled(params);
         }
         return true;
-    }
-    if (modelType == _kGltfPbr) {
+    case MaterialModelType::GltfPbr:
         if (closure) {
             *closure = EvalGltfPbr(params);
         }
         return true;
-    }
-    if (modelType == _kUsdPreviewSurface) {
+    case MaterialModelType::UsdPreviewSurface:
         if (closure) {
             *closure = EvalUsdPreviewSurface(params);
         }
         return true;
-    }
-    if (modelType == _kMaterialXUsdPreviewSurface) {
-        if (closure) {
-            *closure = EvalUsdPreviewSurface(params);
-        }
-        return true;
-    }
-    if (modelType == _kSurfaceConstructor) {
+    case MaterialModelType::SurfaceConstructor:
         if (closure) {
             *closure = EvalSurfaceConstructor(params);
         }
         return true;
-    }
-    if (modelType == _kSurfaceUnlit) {
+    case MaterialModelType::SurfaceUnlit:
         if (closure) {
             *closure = EvalSurfaceUnlit(params);
         }
         return true;
-    }
-    if (modelType == _kVolumeConstructor) {
+    case MaterialModelType::VolumeConstructor:
         if (closure) {
             *closure = EvalVolumeConstructor(params);
         }
         return true;
-    }
-    if (modelType == _kMixVolumeShader) {
+    case MaterialModelType::MixVolumeShader:
         if (closure) {
             *closure = EvalMixVolumeShader(params);
         }
         return true;
-    }
-    if (modelType == _kMixSurfaceShader) {
+    case MaterialModelType::MixSurfaceShader:
         if (closure) {
             static const SlotName bg("bg");
             static const SlotName fg("fg");
@@ -1090,45 +1170,37 @@ EvalGraph::_EvalMaterialModel(
                 Get<float>(params, mix, 0.0f));
         }
         return true;
-    }
-    if (modelType == _kDotSurfaceShader) {
+    case MaterialModelType::DotSurfaceShader:
         if (closure) {
             *closure = Get<SurfaceClosure>(
                 params, _kIn, MakeEmptySurfaceClosure());
         }
         return true;
-    }
-    if (modelType == _kConvertFloatSurfaceShader) {
+    case MaterialModelType::ConvertFloatSurfaceShader:
         if (closure) {
             const float v = Get<float>(params, _kIn, 0.0f);
             *closure = MakeUnlitSurfaceClosure(Vec3f(v));
         }
         return true;
-    }
-    if (modelType == _kConvertIntegerSurfaceShader) {
+    case MaterialModelType::ConvertIntegerSurfaceShader:
         if (closure) {
             const float v = static_cast<float>(Get<int>(params, _kIn, 0));
             *closure = MakeUnlitSurfaceClosure(Vec3f(v));
         }
         return true;
-    }
-    if (modelType == _kConvertBooleanSurfaceShader) {
+    case MaterialModelType::ConvertBooleanSurfaceShader:
         if (closure) {
             const float v = Get<bool>(params, _kIn, false) ? 1.0f : 0.0f;
             *closure = MakeUnlitSurfaceClosure(Vec3f(v));
         }
         return true;
-    }
-    if (modelType == _kConvertColor3SurfaceShader ||
-        modelType == _kConvertVector3SurfaceShader) {
+    case MaterialModelType::ConvertColorOrVector3SurfaceShader:
         if (closure) {
             *closure = MakeUnlitSurfaceClosure(
                 Get<Vec3f>(params, _kIn, Vec3f(0.0f)));
         }
         return true;
-    }
-    if (modelType == _kConvertColor4SurfaceShader ||
-        modelType == _kConvertVector4SurfaceShader) {
+    case MaterialModelType::ConvertColorOrVector4SurfaceShader:
         if (closure) {
             const Vec4f v = Get<Vec4f>(
                 params, _kIn, Vec4f(0.0f, 0.0f, 0.0f, 1.0f));
@@ -1136,14 +1208,16 @@ EvalGraph::_EvalMaterialModel(
                 MakeUnlitSurfaceClosure(Vec3f(v[0], v[1], v[2]), v[3]);
         }
         return true;
-    }
-    if (modelType == _kConvertVector2SurfaceShader) {
+    case MaterialModelType::ConvertVector2SurfaceShader:
         if (closure) {
             const Vec2f v = Get<Vec2f>(params, _kIn, Vec2f(0.0f));
             *closure =
                 MakeUnlitSurfaceClosure(Vec3f(v[0], v[1], 0.0f));
         }
         return true;
+    case MaterialModelType::DisplacementFloat:
+    case MaterialModelType::Unknown:
+        break;
     }
 
     return false;

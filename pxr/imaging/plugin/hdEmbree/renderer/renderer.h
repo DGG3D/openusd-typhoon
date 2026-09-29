@@ -4,7 +4,10 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
-// Modified by DGG3D 2026.
+// Modified by DGG3D 2026. Also: checkpointed, neighbourhood-agreed adaptive
+// stopping (_pixelAdaptivePass, _RetireAgreedAdaptivePixels). Also: a
+// remaining-time estimate for the current frame (GetActivePixelCount,
+// GetEstimatedSecondsRemaining; renderer/aov/adaptiveTimeEstimate.h).
 //
 #ifndef PXR_IMAGING_PLUGIN_HD_EMBREE_RENDERER_H
 #define PXR_IMAGING_PLUGIN_HD_EMBREE_RENDERER_H
@@ -13,6 +16,7 @@
 #include "colorManagement.h"
 #include "renderSettings.h"
 
+#include <renderer/aov/adaptiveTimeEstimate.h>
 #include <renderer/geometry/context.h>
 #include <renderer/geometry/displacementEvaluation.h>
 #include <renderer/integrator/medium.h>
@@ -39,6 +43,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace mxcpp {
@@ -363,6 +368,72 @@ public:
     /// \return Atomic ray count for the current or most recent Render call.
     uint64_t GetAmbientOcclusionRayCount() const;
 
+    /// \brief Get the number of pixels marked adaptively converged so far.
+    ///
+    /// Incremented exactly once per pixel, on its false-to-true adaptive
+    /// convergence transition, and reset wherever the per-pixel convergence
+    /// flags are reset (Clear(), ResetAccumulation(), the coarse-to-full
+    /// preview restart, and a terminal setup failure). Cumulative across
+    /// Render() calls that do not reset convergence, mirroring
+    /// _pixelConverged itself.
+    /// \return Atomic snapshot for the current or most recent Render call.
+    uint64_t GetConvergedPixelCount() const;
+
+    /// \brief Get the number of pixels inside the current data window.
+    ///
+    /// May be smaller than the bound render-buffer resolution when the data
+    /// window does not cover the full buffer; only pixels inside it are ever
+    /// sampled or marked converged.
+    /// \return Atomic snapshot recomputed by every successful
+    /// _PreRenderSetup for the current or most recent Render call.
+    uint64_t GetTotalPixels() const;
+
+    /// \brief Get the number of data-window pixels not yet retired.
+    ///
+    /// \return GetTotalPixels() - GetConvergedPixelCount(), clamped to 0.
+    uint64_t GetActivePixelCount() const;
+
+    /// \brief Get the estimated wall-clock seconds until the current frame
+    /// completes.
+    ///
+    /// Recomputed on the render thread after every full-resolution pass from
+    /// the pass timings and the retirement observed at adaptive checkpoints
+    /// (see renderer/aov/adaptiveTimeEstimate.h). Pause time is not counted.
+    /// Reset wherever the converged-pixel counter is reset and at the start
+    /// of every Render() call.
+    /// \return 0 once the frame is complete; a negative value while unknown
+    /// (fewer than AdaptiveTimeEstimator::kMinTimedPasses passes timed);
+    /// otherwise the estimate in seconds.
+    double GetEstimatedSecondsRemaining() const;
+
+    /// \brief Get overall frame progress as a percentage.
+    ///
+    /// Reports 100 once the renderer considers the frame complete, even if
+    /// that happened via an exit path other than every pixel satisfying
+    /// adaptive convergence (for example, no multi-sampled AOVs remaining
+    /// after the first pass). Otherwise combines the already-converged
+    /// pixel fraction with the completed sample-pass fraction of the
+    /// remaining pixels, matching hdPrman's "percentDone" convention.
+    /// \return A value in [0, 100].
+    double GetPercentDone() const;
+
+    /// \brief Pure percent-done calculation, exposed for unit testing.
+    ///
+    /// \param convergedPixels Pixels already marked adaptively converged.
+    /// \param totalPixels Pixels inside the data window; 0 yields 100.
+    /// \param completedSamples Full-resolution sample passes completed by
+    /// the current Render() call.
+    /// \param samplesToConvergence Per-frame sample-count cap; <= 0 yields
+    /// 100.
+    /// \return 100 * (c + (1 - c) * min(s / N, 1)) with c the converged
+    /// fraction, s completedSamples, and N samplesToConvergence, clamped to
+    /// [0, 100].
+    static double ComputePercentDone(
+        uint64_t convergedPixels,
+        uint64_t totalPixels,
+        int completedSamples,
+        int samplesToConvergence);
+
 private:
     struct _SurfaceInteraction;
 
@@ -454,6 +525,31 @@ private:
     void _RenderTiles(HdRenderThread* renderThread, int sampleNum,
                       uint32_t baseSeed, unsigned int stride,
                       size_t tileStart, size_t tileEnd);
+
+    /// \brief Retire pixels whose 3x3 neighbourhood agrees on convergence.
+    ///
+    /// Runs on the render thread between full-resolution sample passes,
+    /// after the tile pass has joined. A data-window pixel is retired
+    /// (_pixelConverged set, _convergedPixelCount incremented once) only
+    /// when it sits at an adaptive checkpoint count and its own and all
+    /// in-window 8-neighbours' _pixelAdaptivePass flags are set. Never
+    /// un-retires a pixel.
+    void _RetireAgreedAdaptivePixels();
+
+    /// \brief Forget the remaining-time estimate's timings and publish
+    /// "unknown". Called wherever _convergedPixelCount is reset.
+    void _ResetTimeEstimate();
+
+    /// \brief Record one completed full-resolution pass and republish the
+    /// remaining-time estimate. Bookkeeping only.
+    ///
+    /// \param completedPasses Passes completed including this one.
+    /// \param activeBeforePass Pixels this pass sampled.
+    /// \param passSeconds Wall-clock duration of the pass, including its
+    /// retirement sweep, resolve and convergence check.
+    /// \param timed Whether to use \p passSeconds in the pass-time fit.
+    void _UpdateTimeEstimate(int completedPasses, uint64_t activeBeforePass,
+                             double passSeconds, bool timed);
 
     /// \brief Evaluate and write one selected pixel sample.
     ///
@@ -1032,7 +1128,9 @@ private:
 
     /// \brief Add one color sample to a pixel's adaptive statistics.
     ///
-    /// Updates Welford mean/variance and may mark the pixel converged.
+    /// Updates Welford mean/variance and, at adaptive checkpoint counts,
+    /// records whether the pixel passes the convergence test. Never retires
+    /// the pixel; see _RetireAgreedAdaptivePixels().
     /// \param x In-bounds render-buffer x coordinate.
     /// \param y In-bounds render-buffer y coordinate.
     /// \param rgb Finite linear RGB sample.
@@ -1097,7 +1195,41 @@ private:
     std::vector<GfVec3f> _pixelMean;
     std::vector<GfVec3f> _pixelM2;
     std::vector<uint32_t> _pixelSampleCount;
-    std::vector<bool> _pixelConverged;
+    // uint8_t, not bool: std::vector<bool> packs bits, so concurrent writes
+    // to neighbouring pixels from worker threads in _UpdateVariance would
+    // race on the same word.
+    std::vector<uint8_t> _pixelConverged;
+    // Modified by DGG3D 2026: per-pixel result of the adaptive test at the
+    // pixel's most recent checkpoint count (minSamplesBeforeAdaptive * 2^k),
+    // written by the pixel's own worker in _UpdateVariance and read, between
+    // passes, by the neighbourhood sweep. Separate from _pixelConverged:
+    // passing is necessary but not sufficient for retirement. Sized and
+    // reset together with _pixelConverged.
+    std::vector<uint8_t> _pixelAdaptivePass;
+
+    // Pixels inside _pixelConverged that have transitioned false->true,
+    // incremented exactly once per pixel. Reset alongside _pixelConverged
+    // itself; otherwise cumulative across Render() calls.
+    std::atomic<uint64_t> _convergedPixelCount{0};
+
+    // Pixels inside the current data window, recomputed every successful
+    // _PreRenderSetup. May be smaller than _width * _height.
+    std::atomic<uint64_t> _totalPixelsInDataWindow{0};
+
+    // Whether the most recent Render() call considered the frame complete,
+    // through any of its exit paths (full adaptive convergence, the sample
+    // cap, or no multi-sampled AOVs left after the first pass). Drives
+    // GetPercentDone() short-circuiting to 100.
+    std::atomic<bool> _frameComplete{false};
+
+    // Modified by DGG3D 2026: remaining-time estimate. The estimator is
+    // guarded by _timeEstimateMutex (updated once per pass on the render
+    // thread, reset from the reset sites); the derived value is published
+    // through the atomic for GetRenderStats() polling from other threads.
+    // Negative means unknown.
+    std::mutex _timeEstimateMutex;
+    AdaptiveTimeEstimator _adaptiveTimeEstimator;
+    std::atomic<double> _estimatedSecondsRemaining{-1.0};
 
     // How many samples have been completed.
     std::atomic<int> _completedSamples;

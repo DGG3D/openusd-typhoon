@@ -4,7 +4,8 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
-// Modified by DGG3D 2026.
+// Modified by DGG3D 2026: only attach the backface-cull intersection
+// filter while the cull style can actually reject a hit (_UpdateCullFilter).
 //
 #include "mesh.h"
 #include "adaptiveSubdivision.h"
@@ -988,6 +989,27 @@ void HdEmbreeMesh::_EmbreeCullFaces(const RTCFilterFunctionNArguments* args)
             args->valid[i] = 0;
         }
     }
+}
+
+// Modified by DGG3D 2026: only keep _EmbreeCullFaces attached while
+// _cullStyle can actually reject a hit. HdCullStyleDontCare (the default)
+// never culls (see the switch in _EmbreeCullFaces above, whose default case
+// leaves `cull` false), so attaching the filter for it just pays a filter
+// callback per candidate ray hit for no effect. Passing nullptr to
+// rtcSetGeometry{Intersect,Occluded}FilterFunction clears an existing
+// filter. This does not change which hits are accepted for any cull style;
+// it only avoids invoking a filter that would always accept anyway.
+void
+HdEmbreeMesh::_UpdateCullFilter()
+{
+    if (!_geometry) {
+        return;
+    }
+    const bool canCull = (_cullStyle != HdCullStyleDontCare);
+    rtcSetGeometryIntersectFilterFunction(
+        _geometry, canCull ? _EmbreeCullFaces : nullptr);
+    rtcSetGeometryOccludedFilterFunction(
+        _geometry, canCull ? _EmbreeCullFaces : nullptr);
 }
 
 bool
@@ -2077,9 +2099,11 @@ HdEmbreeMesh::_PopulateRtMesh(HdSceneDelegate* sceneDelegate,
         _prototypeContext->subdivisionLevels = &_subdivisionLevels;
         _prototypeContext->material = nullptr;
 
-        // Add _EmbreeCullFaces as a filter function for backface culling.
-        rtcSetGeometryIntersectFilterFunction(_geometry,_EmbreeCullFaces);
-        rtcSetGeometryOccludedFilterFunction(_geometry,_EmbreeCullFaces);
+        // Modified by DGG3D 2026: the cull filter used to be attached here
+        // unconditionally. It is now (re-)attached/detached below, in
+        // _UpdateCullFilter(), based on the current _cullStyle, both here
+        // (on first commit of new geometry) and on every subsequent sync
+        // where cull style may have changed without a full mesh rebuild.
 
         // Force the smooth normals code to rebuild the "normals" primvar the
         // next time smooth normals is enabled.
@@ -2408,6 +2432,13 @@ HdEmbreeMesh::_PopulateRtMesh(HdSceneDelegate* sceneDelegate,
         context->wireframeMode = _GetWireframeMode(desc.geomStyle);
         context->blendWireframeColor = desc.blendWireframeColor;
         context->wireframeLineWidth = desc.lineWidth;
+
+        // Modified by DGG3D 2026: keep the Embree cull filter attached only
+        // while it can actually reject a hit. Runs every sync (cheap: one
+        // rtcSetGeometry*FilterFunction call each, not per-ray), so a
+        // cull-style-only dirty (no topology rebuild, so "newMesh" above is
+        // false) still re-attaches/detaches it correctly.
+        _UpdateCullFilter();
     }
 
     // Clean all dirty bits.

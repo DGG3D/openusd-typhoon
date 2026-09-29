@@ -1999,6 +1999,123 @@ _TestRenderPassSettingsApplication()
     return true;
 }
 
+// Pure math: exercises ComputePercentDone() directly, independent of any
+// Renderer instance, including the guarded totalPixels==0 and
+// samplesToConvergence<=0 edge cases.
+bool
+_TestComputePercentDone()
+{
+    // No pixels yet: the frame has not been set up, so progress is 0, not
+    // 100. Regression: a poll before setup reported 100% and, because the
+    // host clamps progress to never go backwards, pinned the frame at 100%.
+    if (ty::Renderer::ComputePercentDone(
+            /*convergedPixels=*/0, /*totalPixels=*/0,
+            /*completedSamples=*/0, /*samplesToConvergence=*/8) != 0.0) {
+        return false;
+    }
+    // No sample budget: also trivially done, regardless of convergence.
+    if (ty::Renderer::ComputePercentDone(
+            /*convergedPixels=*/0, /*totalPixels=*/4,
+            /*completedSamples=*/0, /*samplesToConvergence=*/0) != 100.0) {
+        return false;
+    }
+    // No pixels converged yet, halfway through the sample budget: only the
+    // sample-fraction term contributes.
+    if (!GfIsClose(
+            ty::Renderer::ComputePercentDone(
+                /*convergedPixels=*/0, /*totalPixels=*/4,
+                /*completedSamples=*/2, /*samplesToConvergence=*/4),
+            50.0, 1.0e-9)) {
+        return false;
+    }
+    // Half the pixels already converged, no samples completed yet for the
+    // remainder: c=0.5, s=0 contributes nothing further.
+    if (!GfIsClose(
+            ty::Renderer::ComputePercentDone(
+                /*convergedPixels=*/2, /*totalPixels=*/4,
+                /*completedSamples=*/0, /*samplesToConvergence=*/4),
+            50.0, 1.0e-9)) {
+        return false;
+    }
+    // Half converged, half of the remaining budget spent: 100*(0.5+0.5*0.5).
+    if (!GfIsClose(
+            ty::Renderer::ComputePercentDone(
+                /*convergedPixels=*/2, /*totalPixels=*/4,
+                /*completedSamples=*/2, /*samplesToConvergence=*/4),
+            75.0, 1.0e-9)) {
+        return false;
+    }
+    // Every pixel converged: 100 regardless of the sample fraction.
+    if (ty::Renderer::ComputePercentDone(
+            /*convergedPixels=*/4, /*totalPixels=*/4,
+            /*completedSamples=*/0, /*samplesToConvergence=*/4) != 100.0) {
+        return false;
+    }
+    // completedSamples beyond the cap must still clamp to 100, not overshoot.
+    if (ty::Renderer::ComputePercentDone(
+            /*convergedPixels=*/0, /*totalPixels=*/4,
+            /*completedSamples=*/9, /*samplesToConvergence=*/4) != 100.0) {
+        return false;
+    }
+    return true;
+}
+
+// Renderer-level: a data window smaller than the bound render buffer must
+// drive GetTotalPixels(), not the buffer's full resolution, and
+// GetConvergedPixelCount() must count each pixel's adaptive convergence
+// exactly once and reset wherever the per-pixel flags reset.
+bool
+_TestConvergedPixelStats()
+{
+    _Scene scene;
+    // A buffer larger than the data window: only the 2 pixels inside the
+    // 2x1 data window may ever be sampled or converge.
+    _CountingRenderBuffer color(
+        SdfPath("/convergenceStatsColor"), 3, 3, HdFormatFloat32Vec4);
+    const GfRect2i dataWindow(GfVec2i(0), 2, 1);
+
+    ty::Renderer renderer;
+    HdRenderThread renderThread;
+    _Configure(
+        &renderer,
+        scene.scene,
+        {_Binding(HdAovTokens->color, &color)},
+        dataWindow);
+
+    ty::RenderSettings settings;
+    settings.samplesToConvergence = 4;
+    settings.minSamplesBeforeAdaptive = 1;
+    settings.adaptiveThreshold = 0.0f;
+    renderer.SetRenderSettings(settings);
+
+    renderThread.StartRender();
+    renderer.Render(&renderThread);
+
+    // An empty scene's constant miss radiance converges on the first pass;
+    // only the 2 in-window pixels count, not the 3x3 buffer.
+    if (!TF_VERIFY(renderer.GetTotalPixels() == 2) ||
+        !TF_VERIFY(renderer.GetConvergedPixelCount() == 2) ||
+        !TF_VERIFY(renderer.GetCompletedSamples() == 1) ||
+        !TF_VERIFY(renderer.GetPercentDone() == 100.0)) {
+        return false;
+    }
+
+    // Clear() and ResetAccumulation() must zero the counter alongside the
+    // per-pixel flags they reset.
+    renderer.Clear();
+    if (!TF_VERIFY(renderer.GetConvergedPixelCount() == 0)) {
+        return false;
+    }
+
+    renderer.Render(&renderThread);
+    if (!TF_VERIFY(renderer.GetConvergedPixelCount() == 2)) {
+        return false;
+    }
+
+    renderer.ResetAccumulation();
+    return TF_VERIFY(renderer.GetConvergedPixelCount() == 0);
+}
+
 } // anonymous namespace
 
 int
@@ -2028,5 +2145,7 @@ main()
     TF_AXIOM(_TestAmbientOcclusionAov());
     TF_AXIOM(_TestCameraJitterTileDeterminism());
     TF_AXIOM(_TestRenderPassSettingsApplication());
+    TF_AXIOM(_TestComputePercentDone());
+    TF_AXIOM(_TestConvergedPixelStats());
     return 0;
 }

@@ -4,10 +4,13 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026: parallelize Resolve() across rows.
+//
 #include "renderBuffer.h"
 #include "renderParam.h"
 
 #include "pxr/base/gf/half.h"
+#include "pxr/base/work/loops.h"
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -268,33 +271,48 @@ HdEmbreeRenderBuffer::Resolve()
     size_t formatSize = HdDataSizeOfFormat(_format);
     size_t sampleSize = HdDataSizeOfFormat(_GetSampleFormat(_format));
 
-    for (unsigned int i = 0; i < _width * _height; ++i) {
+    // Each pixel's resolved value depends only on its own sample
+    // accumulation, so rows can be resolved independently and in parallel
+    // without affecting the result (same math, same rounding, just
+    // reordered across threads).
+    WorkParallelForN(
+        _height,
+        [&](size_t rowBegin, size_t rowEnd) {
+            for (size_t row = rowBegin; row < rowEnd; ++row) {
+                const unsigned int rowStart =
+                    static_cast<unsigned int>(row) * _width;
+                const unsigned int rowEndPixel = rowStart + _width;
+                for (unsigned int i = rowStart; i < rowEndPixel; ++i) {
 
-        int sampleCount = _sampleCount[i];
-        // Skip pixels with no samples.
-        if (sampleCount == 0) {
-            continue;
-        }
+                    int sampleCount = _sampleCount[i];
+                    // Skip pixels with no samples.
+                    if (sampleCount == 0) {
+                        continue;
+                    }
 
-        uint8_t *dst = &_buffer[i*formatSize];
-        uint8_t *src = &_sampleBuffer[i*sampleSize];
-        for (size_t c = 0; c < componentCount; ++c) {
-            if (componentFormat == HdFormatInt32) {
-                ((int32_t*)dst)[c] = ((int32_t*)src)[c] / sampleCount;
-            } else if (componentFormat == HdFormatFloat16) {
-                ((uint16_t*)dst)[c] = GfHalf(
-                    ((float*)src)[c] / sampleCount).bits();
-            } else if (componentFormat == HdFormatFloat32) {
-                ((float*)dst)[c] = ((float*)src)[c] / sampleCount;
-            } else if (componentFormat == HdFormatUNorm8) {
-                ((uint8_t*)dst)[c] = (uint8_t)
-                    (((float*)src)[c] * 255.0f / sampleCount);
-            } else if (componentFormat == HdFormatSNorm8) {
-                ((int8_t*)dst)[c] = (int8_t)
-                    (((float*)src)[c] * 127.0f / sampleCount);
+                    uint8_t *dst = &_buffer[i*formatSize];
+                    uint8_t *src = &_sampleBuffer[i*sampleSize];
+                    for (size_t c = 0; c < componentCount; ++c) {
+                        if (componentFormat == HdFormatInt32) {
+                            ((int32_t*)dst)[c] =
+                                ((int32_t*)src)[c] / sampleCount;
+                        } else if (componentFormat == HdFormatFloat16) {
+                            ((uint16_t*)dst)[c] = GfHalf(
+                                ((float*)src)[c] / sampleCount).bits();
+                        } else if (componentFormat == HdFormatFloat32) {
+                            ((float*)dst)[c] =
+                                ((float*)src)[c] / sampleCount;
+                        } else if (componentFormat == HdFormatUNorm8) {
+                            ((uint8_t*)dst)[c] = (uint8_t)
+                                (((float*)src)[c] * 255.0f / sampleCount);
+                        } else if (componentFormat == HdFormatSNorm8) {
+                            ((int8_t*)dst)[c] = (int8_t)
+                                (((float*)src)[c] * 127.0f / sampleCount);
+                        }
+                    }
+                }
             }
-        }
-    }
+        });
 }
 
 void

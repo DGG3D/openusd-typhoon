@@ -4,6 +4,11 @@
 // Licensed under the terms set forth in the LICENSE.txt file available at
 // https://openusd.org/license.
 //
+// Modified by DGG3D 2026: add
+// TestRemainingMaterialModelTerminalsMapToSameEvaluator, covering the
+// terminal-model node types not already exercised as a terminal above, to
+// pin the string -> MaterialModelType classification in graph.cpp.
+//
 #include <renderer/materials/MaterialXCpp/graph.h>
 #include <renderer/materials/MaterialXCpp/nodeRegistry.h>
 #include <renderer/materials/MaterialXCpp/surfaceShaderUtils.h>
@@ -1315,6 +1320,150 @@ _MalformedGeomPropUsesDefault(const MaterialGraph& network)
         lookupData.requestedHandles.empty();
 }
 
+// Modified by DGG3D 2026: exercises the terminal-model dispatch switch in
+// EvalGraph::_EvalMaterialModel(MaterialModelType, ...) for the node types
+// that were not already reached, as a terminal, by another test above
+// (SurfaceVolumeMaterial/StandardSurface/OpenPbr/DisneyPrincipled/GltfPbr/
+// UsdPreviewSurface/DisplacementFloat via the *Terminal tests,
+// VolumeConstructor via TestCompileVolumeOnlyMaterial, DotSurfaceShader via
+// TestDotSurfaceShaderTerminalPassThrough, MixSurfaceShader via
+// TestMixSurfaceClosuresPreservesVolumeBoundaryIdentity). Confirms the enum
+// classification produced by _ClassifyMaterialModel() still routes every
+// one of these node-type-id strings to the same evaluator the old
+// string-comparison chain did.
+static bool
+TestRemainingMaterialModelTerminalsMapToSameEvaluator()
+{
+    MaterialGraph unlitNetwork;
+    GraphNode unlitTerm;
+    unlitTerm.nodeTypeId = "ND_surface_unlit";
+    unlitTerm.parameters["emission"] = Value(2.0f);
+    unlitTerm.parameters["emission_color"] = Value(Vec3f(0.1f, 0.2f, 0.3f));
+    unlitNetwork.nodes["/Material/Unlit"] = unlitTerm;
+    unlitNetwork.terminals["surface"] = {"/Material/Unlit", "out"};
+    CompileResult unlitResult = EvalGraph::Compile(unlitNetwork);
+    if (!unlitResult.graph || !unlitResult.graph->IsValid()) {
+        return false;
+    }
+    if (!Test_IsClose(
+            unlitResult.graph->Evaluate(ShadingContext{}).emissiveColor,
+            Vec3f(0.2f, 0.4f, 0.6f), 1e-4f)) {
+        return false;
+    }
+
+    MaterialGraph surfaceConstructorNetwork;
+    GraphNode edf;
+    edf.nodeTypeId = "ND_uniform_edf";
+    edf.parameters["color"] = Value(Vec3f(0.3f, 0.4f, 0.5f));
+    surfaceConstructorNetwork.nodes["/Material/Edf"] = edf;
+    GraphNode surfaceTerm;
+    surfaceTerm.nodeTypeId = "ND_surface";
+    surfaceTerm.inputConnections["edf"] = {{"/Material/Edf", "out"}};
+    surfaceConstructorNetwork.nodes["/Material/Surface"] = surfaceTerm;
+    surfaceConstructorNetwork.terminals["surface"] =
+        {"/Material/Surface", "out"};
+    CompileResult surfaceConstructorResult =
+        EvalGraph::Compile(surfaceConstructorNetwork);
+    if (!surfaceConstructorResult.graph ||
+        !surfaceConstructorResult.graph->IsValid()) {
+        return false;
+    }
+    if (!Test_IsClose(
+            surfaceConstructorResult.graph->Evaluate(ShadingContext{})
+                .emissiveColor,
+            Vec3f(0.3f, 0.4f, 0.5f), 1e-4f)) {
+        return false;
+    }
+
+    MaterialGraph mixVolumeNetwork;
+    GraphNode bgVolume;
+    bgVolume.nodeTypeId = "ND_volume";
+    mixVolumeNetwork.nodes["/Material/BgVolume"] = bgVolume;
+    GraphNode fgVolume;
+    fgVolume.nodeTypeId = "ND_volume";
+    mixVolumeNetwork.nodes["/Material/FgVolume"] = fgVolume;
+    GraphNode mixVolumeTerm;
+    mixVolumeTerm.nodeTypeId = "ND_mix_volumeshader";
+    mixVolumeTerm.inputConnections["bg"] = {{"/Material/BgVolume", "out"}};
+    mixVolumeTerm.inputConnections["fg"] = {{"/Material/FgVolume", "out"}};
+    mixVolumeTerm.parameters["mix"] = Value(0.5f);
+    mixVolumeNetwork.nodes["/Material/MixVolume"] = mixVolumeTerm;
+    mixVolumeNetwork.terminals["surface"] = {"/Material/MixVolume", "out"};
+    CompileResult mixVolumeResult = EvalGraph::Compile(mixVolumeNetwork);
+    if (!mixVolumeResult.graph || !mixVolumeResult.graph->IsValid()) {
+        return false;
+    }
+    // Both inputs are the vacuum default, so the mix stays a (vacuum)
+    // volume boundary; just confirm it compiled and evaluated through the
+    // MixVolumeShader arm without producing a surface-shaded closure.
+    if (!mixVolumeResult.graph->Evaluate(ShadingContext{})
+             .isVolumeBoundary) {
+        return false;
+    }
+
+    struct ConvertCase {
+        const char* nodeTypeId;
+        Value inValue;
+        Vec3f expectedEmissive;
+    };
+    const ConvertCase convertCases[] = {
+        {"ND_convert_float_surfaceshader", Value(0.5f), Vec3f(0.5f)},
+        {"ND_convert_integer_surfaceshader", Value(3), Vec3f(3.0f)},
+        {"ND_convert_boolean_surfaceshader", Value(true), Vec3f(1.0f)},
+        {"ND_convert_color3_surfaceshader",
+         Value(Vec3f(0.1f, 0.2f, 0.3f)), Vec3f(0.1f, 0.2f, 0.3f)},
+        {"ND_convert_vector3_surfaceshader",
+         Value(Vec3f(0.4f, 0.5f, 0.6f)), Vec3f(0.4f, 0.5f, 0.6f)},
+        {"ND_convert_vector2_surfaceshader",
+         Value(Vec2f(0.7f, 0.8f)), Vec3f(0.7f, 0.8f, 0.0f)},
+    };
+    for (const ConvertCase& testCase : convertCases) {
+        MaterialGraph network;
+        GraphNode termNode;
+        termNode.nodeTypeId = testCase.nodeTypeId;
+        termNode.parameters["in"] = testCase.inValue;
+        network.nodes["/Material/Convert"] = termNode;
+        network.terminals["surface"] = {"/Material/Convert", "out"};
+
+        CompileResult compileResult = EvalGraph::Compile(network);
+        if (!compileResult.graph || !compileResult.graph->IsValid()) {
+            return false;
+        }
+        if (!Test_IsClose(
+                compileResult.graph->Evaluate(ShadingContext{})
+                    .emissiveColor,
+                testCase.expectedEmissive, 1e-4f)) {
+            return false;
+        }
+    }
+
+    // ND_convert_color4_surfaceshader and ND_convert_vector4_surfaceshader
+    // share the ConvertColorOrVector4SurfaceShader arm and additionally
+    // carry alpha through as opacity.
+    for (const char* nodeTypeId :
+         {"ND_convert_color4_surfaceshader",
+          "ND_convert_vector4_surfaceshader"}) {
+        MaterialGraph network;
+        GraphNode termNode;
+        termNode.nodeTypeId = nodeTypeId;
+        termNode.parameters["in"] = Value(Vec4f(0.1f, 0.2f, 0.3f, 0.4f));
+        network.nodes["/Material/Convert4"] = termNode;
+        network.terminals["surface"] = {"/Material/Convert4", "out"};
+
+        CompileResult compileResult = EvalGraph::Compile(network);
+        if (!compileResult.graph || !compileResult.graph->IsValid()) {
+            return false;
+        }
+        const SurfaceClosure closure =
+            compileResult.graph->Evaluate(ShadingContext{});
+        if (!Test_IsClose(closure.opacity, 0.4f, 1e-4f)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool
 TestCompileMalformedGeomPropNameUsesDefault()
 {
@@ -1381,6 +1530,7 @@ Test_RegisterGraphTests()
     _REG(TestCompileVolumeOnlyMaterial);
     _REG(TestDotSurfaceShaderTerminalPassThrough);
     _REG(TestMixSurfaceClosuresPreservesVolumeBoundaryIdentity);
+    _REG(TestRemainingMaterialModelTerminalsMapToSameEvaluator);
     _REG(TestMixedGraphLeafNormalsValidateAgainstFinalGraphNormal);
     _REG(TestResolveGraphNormalFallbacks);
     _REG(TestEvaluateConstantDisplacement);
