@@ -10,6 +10,9 @@
 // pixel only when its 3x3 neighbourhood agrees (_RetireAgreedAdaptivePixels).
 // Also: per-pass timing for a remaining-time estimate of the current frame
 // (_UpdateTimeEstimate, GetEstimatedSecondsRemaining); bookkeeping only.
+// Also: per-tile tracing time and a per-pixel work prediction feeding that
+// estimate (_UpdateWorkPrediction, GetAdaptiveWorkPrediction); bookkeeping
+// only.
 //
 // Frame orchestration and renderer configuration.
 
@@ -27,10 +30,12 @@
 #include "pxr/imaging/hd/perfLog.h"
 #include "pxr/imaging/hd/renderBuffer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 // -------------------------------------------------------------------------
 // Old TBB workaround - we plan to remove this once OpenUSD adopts
@@ -296,6 +301,17 @@ ty::Renderer::GetEstimatedSecondsRemaining() const
     return _estimatedSecondsRemaining.load(std::memory_order_relaxed);
 }
 
+bool
+ty::Renderer::GetAdaptiveWorkPrediction(
+    ty::AdaptiveWorkPrediction* outWork,
+    ty::AdaptivePassCostRates* outRates) const
+{
+    std::lock_guard<std::mutex> lock(_timeEstimateMutex);
+    *outWork = _adaptiveTimeEstimator.GetWorkPrediction();
+    _adaptiveTimeEstimator.GetMeasuredPassCost(outRates);
+    return outWork->completedPasses > 0;
+}
+
 void
 ty::Renderer::_ResetTimeEstimate()
 {
@@ -307,13 +323,20 @@ ty::Renderer::_ResetTimeEstimate()
 void
 ty::Renderer::_UpdateTimeEstimate(
     int completedPasses, uint64_t activeBeforePass, double passSeconds,
-    bool timed)
+    bool timed, double traceSeconds, double traceCpuSeconds)
 {
     const uint64_t activeAfterPass = GetActivePixelCount();
     const int minSamples = _settings.minSamplesBeforeAdaptive;
     std::lock_guard<std::mutex> lock(_timeEstimateMutex);
     if (timed) {
         _adaptiveTimeEstimator.RecordPass(activeBeforePass, passSeconds);
+        // The pass belongs to the level ending at the first checkpoint at or
+        // after it.
+        _adaptiveTimeEstimator.RecordPassCost(
+            ty::NextAdaptiveCheckpoint(
+                static_cast<uint64_t>(std::max(0, completedPasses - 1)),
+                minSamples),
+            completedPasses, passSeconds, traceSeconds, traceCpuSeconds);
     }
     // Every active pixel now holds completedPasses samples, so this pass's
     // sweep could only retire pixels if that count is a checkpoint.
@@ -591,6 +614,23 @@ ty::Renderer::Render(HdRenderThread *renderThread)
     static const std::chrono::milliseconds kResolveThrottleInterval(250);
     auto lastResolveTime = std::chrono::steady_clock::now();
 
+    // Modified by DGG3D 2026: per-tile tracing time of this frame's
+    // full-resolution passes, for the work prediction. The prediction is
+    // refreshed at every adaptive checkpoint (right after its retirement
+    // sweep) and otherwise at most once per kWorkPredictionInterval: it
+    // sweeps the whole data window twice, which is cheap next to a pass but
+    // not free.
+    _tileTraceSeconds.assign(
+        static_cast<size_t>(numTilesX) * numTilesY, 0.0);
+    _tileTraceSamples.assign(
+        static_cast<size_t>(numTilesX) * numTilesY, 0.0);
+    _pixelTraceSeconds.assign(_pixelConverged.size(), 0.0f);
+    _pixelTraceSamples.assign(_pixelConverged.size(), 0.0f);
+    static const std::chrono::milliseconds kWorkPredictionInterval(1000);
+    std::chrono::steady_clock::time_point lastWorkPredictionTime =
+        std::chrono::steady_clock::now();
+    bool workPredicted = false;
+
     bool renderFinished = false;
     for (int i = 0; i < _settings.samplesToConvergence; ++i) {
         // Pause point.
@@ -610,6 +650,7 @@ ty::Renderer::Render(HdRenderThread *renderThread)
         const auto passStartTime = std::chrono::steady_clock::now();
         const uint64_t activeBeforePass = GetActivePixelCount();
 
+        _passTraceCpuNanoseconds.store(0, std::memory_order_relaxed);
         {
             HD_TRACE_SCOPE("ty::Renderer::TraceSamplePass");
             WorkParallelForN(numTilesX * numTilesY,
@@ -617,6 +658,10 @@ ty::Renderer::Render(HdRenderThread *renderThread)
                     renderThread, i, baseSeed, /*stride=*/1u,
                     std::placeholders::_1, std::placeholders::_2));
         }
+        const double traceSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - passStartTime).count();
+        const double traceCpuSeconds = 1e-9 * static_cast<double>(
+            _passTraceCpuNanoseconds.load(std::memory_order_relaxed));
 
         // Modified by DGG3D 2026: adaptive retirement is a separate phase.
         // The pass above only recorded, per pixel, whether it passed the
@@ -704,14 +749,33 @@ ty::Renderer::Render(HdRenderThread *renderThread)
 
         // Modified by DGG3D 2026: feed the remaining-time estimate. A pass
         // cut short by a stop request is not representative and is skipped.
-        // The first pass is not used for the pass-time fit: it carries
+        // The first kAlwaysResolvePasses passes are not timed: they carry
         // one-off warm-up costs (texture and cache population, the
-        // single-sampled AOVs) that later passes do not repeat.
+        // single-sampled AOVs, an unthrottled resolve every pass) that later
+        // passes do not repeat. The work prediction runs before the pass
+        // time is taken, so its own cost is part of the measured overhead.
         if (!renderThread->IsStopRequested()) {
+            const std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now();
+            const bool predictionDue =
+                (i + 1) >= ty::kAdaptivePredictionMinPasses &&
+                (!workPredicted ||
+                 ty::IsAdaptiveCheckpoint(
+                     static_cast<uint32_t>(i + 1),
+                     _settings.minSamplesBeforeAdaptive) ||
+                 now - lastWorkPredictionTime >= kWorkPredictionInterval);
+            if (predictionDue && !_pixelConverged.empty()) {
+                HD_TRACE_SCOPE("ty::Renderer::UpdateWorkPrediction");
+                _UpdateWorkPrediction(i + 1);
+                lastWorkPredictionTime = now;
+                workPredicted = true;
+            }
             const double passSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - passStartTime).count();
             _UpdateTimeEstimate(
-                i + 1, activeBeforePass, passSeconds, /*timed=*/i > 0);
+                i + 1, activeBeforePass, passSeconds,
+                /*timed=*/i >= kAlwaysResolvePasses,
+                traceSeconds, traceCpuSeconds);
         }
 
         // Cancellation point.
@@ -848,16 +912,12 @@ ty::Renderer::Render(HdRenderThread *renderThread)
     }
 }
 
-// Modified by DGG3D 2026: new. See the declaration in renderer.h and
-// renderer/aov/adaptiveConvergence.h.
-void
-ty::Renderer::_RetireAgreedAdaptivePixels()
+// Modified by DGG3D 2026: new, factored out of _RetireAgreedAdaptivePixels.
+bool
+ty::Renderer::_GetAdaptiveWindow(ty::AdaptiveWindow* outWindow) const
 {
-    if (_pixelConverged.empty() ||
-        _pixelAdaptivePass.size() != _pixelConverged.size() ||
-        _pixelSampleCount.size() != _pixelConverged.size() ||
-        _width == 0 || _height == 0) {
-        return;
+    if (_width == 0 || _height == 0) {
+        return false;
     }
 
     // Same buffer-space data window as _RenderTiles: the data window is
@@ -869,14 +929,262 @@ ty::Renderer::_RetireAgreedAdaptivePixels()
     minY = _height - minY;
     maxY = _height - maxY;
 
-    ty::AdaptiveWindow window;
-    window.minX = std::min(
+    outWindow->minX = std::min(
         static_cast<unsigned int>(_dataWindow.GetMinX()), _width);
-    window.maxX = std::min(
+    outWindow->maxX = std::min(
         static_cast<unsigned int>(_dataWindow.GetMaxX() + 1), _width);
-    window.minY = std::min(minY, _height);
-    window.maxY = std::min(maxY, _height);
-    if (window.minX >= window.maxX || window.minY >= window.maxY) {
+    outWindow->minY = std::min(minY, _height);
+    outWindow->maxY = std::min(maxY, _height);
+    return outWindow->minX < outWindow->maxX &&
+        outWindow->minY < outWindow->maxY;
+}
+
+// Modified by DGG3D 2026: new. See the declaration in renderer.h and the
+// model in renderer/aov/adaptiveTimeEstimate.h.
+void
+ty::Renderer::_UpdateWorkPrediction(int completedPasses)
+{
+    const size_t numPixels = _pixelConverged.size();
+    ty::AdaptiveWindow window;
+    if (numPixels == 0 || completedPasses <= 0 ||
+        _pixelMean.size() != numPixels || _pixelM2.size() != numPixels ||
+        _pixelSampleCount.size() != numPixels ||
+        _tileTraceSeconds.empty() ||
+        _tileTraceSamples.size() != _tileTraceSeconds.size() ||
+        _settings.tileSize <= 0 ||
+        !_GetAdaptiveWindow(&window)) {
+        return;
+    }
+
+    ty::AdaptiveWorkPrediction work;
+    work.completedPasses = completedPasses;
+    work.numLevels = ty::BuildAdaptiveLevels(
+        _settings.minSamplesBeforeAdaptive, _settings.samplesToConvergence,
+        work.levelEndPass);
+    if (work.numLevels == 0) {
+        return;
+    }
+    const uint64_t done = static_cast<uint64_t>(completedPasses);
+    work.currentLevel = ty::AdaptiveLevelOfPass(
+        done + 1, work.levelEndPass, work.numLevels);
+    _pixelRetireLevel.resize(numPixels, uint8_t(0));
+
+    // Each pixel's own retirement level: the first level from the current
+    // one whose end checkpoint is at least both the next pass and the
+    // pixel's predicted passing count. The last level when none is, or when
+    // there is nothing to predict from: the pixel is traced to the pass cap.
+    // Stored as level + 1 for the neighbourhood sweep below.
+    const float threshold = _settings.adaptiveThreshold;
+    WorkParallelForN(window.maxY - window.minY,
+        [this, &window, &work, threshold, done](
+            size_t rowBegin, size_t rowEnd) {
+            for (size_t row = rowBegin; row < rowEnd; ++row) {
+                const size_t y = window.minY + row;
+                for (unsigned int x = window.minX; x < window.maxX; ++x) {
+                    const size_t idx = y * _width + x;
+                    if (_pixelConverged[idx]) {
+                        continue;
+                    }
+                    const double passingCount =
+                        ty::PredictAdaptivePassingCount(
+                            _pixelMean[idx], _pixelM2[idx],
+                            _pixelSampleCount[idx], threshold);
+                    int level = work.numLevels - 1;
+                    if (passingCount >= 0.0) {
+                        const double target = std::max(
+                            passingCount, static_cast<double>(done + 1));
+                        level = work.currentLevel;
+                        while (level + 1 < work.numLevels &&
+                               static_cast<double>(
+                                   work.levelEndPass[level]) < target) {
+                            ++level;
+                        }
+                    }
+                    _pixelRetireLevel[idx] = static_cast<uint8_t>(level + 1);
+                }
+            }
+        });
+
+    // Measured tracing time per sample of each tile (see _RenderTiles); a
+    // tile without timed samples falls back to the frame average.
+    double totalTileSeconds = 0.0;
+    double totalTileSamples = 0.0;
+    for (size_t tile = 0; tile < _tileTraceSeconds.size(); ++tile) {
+        totalTileSeconds += _tileTraceSeconds[tile];
+        totalTileSamples += _tileTraceSamples[tile];
+    }
+    const double averageSecondsPerSample = (totalTileSamples > 0.0)
+        ? totalTileSeconds / totalTileSamples : 0.0;
+
+    // Per tile, laid out as in _RenderTiles: a pixel retires only once its
+    // whole in-window 3x3 neighbourhood passes, and retired neighbours have
+    // passed already, so its level is the maximum over its active
+    // neighbourhood. This treats passing as permanent (see
+    // adaptiveTimeEstimate.h). Histograms by level are merged per chunk.
+    const unsigned int tileSize =
+        static_cast<unsigned int>(_settings.tileSize);
+    const unsigned int numTilesX =
+        (_dataWindow.GetWidth() + tileSize - 1) / tileSize;
+    uint64_t pixelsAtLevel[ty::kMaxAdaptiveLevels] = {};
+    uint64_t tilesAtLevel[ty::kMaxAdaptiveLevels] = {};
+    double secondsAtLevel[ty::kMaxAdaptiveLevels] = {};
+    uint64_t remainingPixelSamples = 0;
+    std::mutex mergeMutex;
+    const size_t numTiles = _tileTraceSeconds.size();
+    const size_t numLevels = static_cast<size_t>(work.numLevels);
+    _tileLevelSeconds.assign(numTiles * numLevels, 0.0);
+    // Pixels are costed by their own measured tracing time per sample (see
+    // kAdaptivePixelTimingInterval), else by their tile's average.
+    const bool havePixelTiming =
+        _pixelTraceSeconds.size() == numPixels &&
+        _pixelTraceSamples.size() == numPixels;
+    WorkParallelForN(numTiles,
+        [this, &window, &work, &mergeMutex, &pixelsAtLevel, &tilesAtLevel,
+         &secondsAtLevel, &remainingPixelSamples, tileSize, numTilesX,
+         numLevels, averageSecondsPerSample, havePixelTiming, done](
+            size_t tileBegin, size_t tileEnd) {
+            uint64_t chunkPixels[ty::kMaxAdaptiveLevels] = {};
+            uint64_t chunkTiles[ty::kMaxAdaptiveLevels] = {};
+            double chunkSeconds[ty::kMaxAdaptiveLevels] = {};
+            uint64_t chunkRemaining = 0;
+            for (size_t tile = tileBegin; tile < tileEnd; ++tile) {
+                const unsigned int tileY =
+                    static_cast<unsigned int>(tile / numTilesX);
+                const unsigned int tileX =
+                    static_cast<unsigned int>(tile - size_t(tileY) * numTilesX);
+                const unsigned int x0 = window.minX + tileX * tileSize;
+                const unsigned int y0 = window.minY + tileY * tileSize;
+                const unsigned int x1 = std::min(x0 + tileSize, window.maxX);
+                const unsigned int y1 = std::min(y0 + tileSize, window.maxY);
+                const double secondsPerSample =
+                    (_tileTraceSamples[tile] > 0.0)
+                    ? _tileTraceSeconds[tile] / _tileTraceSamples[tile]
+                    : averageSecondsPerSample;
+                int tileLevel = -1;
+                double tileSecondsAtLevel[ty::kMaxAdaptiveLevels] = {};
+                for (unsigned int y = y0; y < y1; ++y) {
+                    for (unsigned int x = x0; x < x1; ++x) {
+                        const size_t idx = size_t(y) * _width + x;
+                        if (_pixelConverged[idx]) {
+                            continue;
+                        }
+                        const unsigned int nx0 = (x > window.minX) ? x - 1 : x;
+                        const unsigned int ny0 = (y > window.minY) ? y - 1 : y;
+                        const unsigned int nx1 = std::min(x + 2, window.maxX);
+                        const unsigned int ny1 = std::min(y + 2, window.maxY);
+                        int level = 0;
+                        for (unsigned int ny = ny0; ny < ny1; ++ny) {
+                            for (unsigned int nx = nx0; nx < nx1; ++nx) {
+                                const size_t neighbourIdx =
+                                    size_t(ny) * _width + nx;
+                                if (!_pixelConverged[neighbourIdx]) {
+                                    level = std::max(level,
+                                        int(_pixelRetireLevel[neighbourIdx]) - 1);
+                                }
+                            }
+                        }
+                        const double pixelSecondsPerSample =
+                            (havePixelTiming && _pixelTraceSamples[idx] > 0.0f)
+                            ? double(_pixelTraceSeconds[idx]) /
+                              double(_pixelTraceSamples[idx])
+                            : secondsPerSample;
+                        chunkPixels[level] += 1;
+                        chunkSeconds[level] += pixelSecondsPerSample;
+                        tileSecondsAtLevel[level] += pixelSecondsPerSample;
+                        chunkRemaining += work.levelEndPass[level] - done;
+                        tileLevel = std::max(tileLevel, level);
+                    }
+                }
+                if (tileLevel >= 0) {
+                    chunkTiles[tileLevel] += 1;
+                    // The tile's tracing time per pass of each level: its
+                    // pixels whose last level is at or after that level.
+                    double tileSeconds = 0.0;
+                    for (int level = tileLevel; level >= work.currentLevel;
+                         --level) {
+                        tileSeconds += tileSecondsAtLevel[level];
+                        _tileLevelSeconds[tile * numLevels + size_t(level)] =
+                            tileSeconds;
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> lock(mergeMutex);
+            for (int level = 0; level < work.numLevels; ++level) {
+                pixelsAtLevel[level] += chunkPixels[level];
+                tilesAtLevel[level] += chunkTiles[level];
+                secondsAtLevel[level] += chunkSeconds[level];
+            }
+            remainingPixelSamples += chunkRemaining;
+        });
+
+    // A pixel or tile whose last level is L is active in every level up to
+    // L: suffix sums from the last level down to the current one.
+    uint64_t pixels = 0;
+    uint64_t tiles = 0;
+    double seconds = 0.0;
+    for (int level = work.numLevels - 1; level >= work.currentLevel; --level) {
+        pixels += pixelsAtLevel[level];
+        tiles += tilesAtLevel[level];
+        seconds += secondsAtLevel[level];
+        work.activePixels[level] = pixels;
+        work.activeTiles[level] = tiles;
+        work.traceCpuSeconds[level] = seconds;
+    }
+    work.remainingPixelSamples = remainingPixelSamples;
+
+    // Tile-loop makespan per level. The pass's WorkParallelForN is a
+    // tbb::parallel_for over the tile indices with the default
+    // auto_partitioner (pxr/base/work/workTBB/loops_impl.h): about one task
+    // per thread, each splitting its own range to depth __TBB_INIT_DEPTH (5)
+    // and further only on demand, so aligned runs of about
+    // numTiles / (threads * 32) consecutive tiles execute on one thread.
+    // Their predicted tracing times are scheduled longest-first over the
+    // threads (see adaptiveTimeEstimate.h).
+    work.threads = static_cast<int>(std::max(1u, WorkGetConcurrencyLimit()));
+    work.runTiles = static_cast<int>(std::max<size_t>(1,
+        numTiles / (static_cast<size_t>(work.threads) * 32)));
+    const size_t runTiles = static_cast<size_t>(work.runTiles);
+    std::vector<double> runSeconds;
+    for (int level = work.currentLevel; level < work.numLevels; ++level) {
+        runSeconds.assign((numTiles + runTiles - 1) / runTiles, 0.0);
+        for (size_t tile = 0; tile < numTiles; ++tile) {
+            runSeconds[tile / runTiles] +=
+                _tileLevelSeconds[tile * numLevels + size_t(level)];
+        }
+        runSeconds.erase(
+            std::remove(runSeconds.begin(), runSeconds.end(), 0.0),
+            runSeconds.end());
+        work.maxRunSeconds[level] = runSeconds.empty()
+            ? 0.0 : *std::max_element(runSeconds.begin(), runSeconds.end());
+        work.traceWallSeconds[level] =
+            ty::AdaptiveScheduleMakespan(&runSeconds, work.threads);
+    }
+
+    // Halve the tile timings, so they follow the pixels that remain (the
+    // cost of retired pixels fades out) while still averaging over several
+    // passes.
+    for (size_t tile = 0; tile < _tileTraceSeconds.size(); ++tile) {
+        _tileTraceSeconds[tile] *= 0.5;
+        _tileTraceSamples[tile] *= 0.5;
+    }
+
+    std::lock_guard<std::mutex> lock(_timeEstimateMutex);
+    _adaptiveTimeEstimator.SetWorkPrediction(work);
+}
+
+// Modified by DGG3D 2026: new. See the declaration in renderer.h and
+// renderer/aov/adaptiveConvergence.h.
+void
+ty::Renderer::_RetireAgreedAdaptivePixels()
+{
+    if (_pixelConverged.empty() ||
+        _pixelAdaptivePass.size() != _pixelConverged.size() ||
+        _pixelSampleCount.size() != _pixelConverged.size()) {
+        return;
+    }
+
+    ty::AdaptiveWindow window;
+    if (!_GetAdaptiveWindow(&window)) {
         return;
     }
 
@@ -974,12 +1282,29 @@ ty::Renderer::_RenderTiles(HdRenderThread *renderThread, int sampleNum,
     const unsigned int numTilesX =
         (_dataWindow.GetWidth() + tileSize - 1) / tileSize;
 
+    // Modified by DGG3D 2026: full-resolution passes time each tile's
+    // tracing for the work prediction: two clock reads per tile that has an
+    // active pixel, none per sample. The clock starts at the tile's first
+    // active pixel, so retired tiles cost nothing. Each tile is traced by
+    // exactly one worker per pass, so its accumulators need no lock.
+    const bool timeTiles = stride == 1 && tileEnd <= _tileTraceSeconds.size();
+    // Every kAdaptivePixelTimingInterval-th pass (not the warm-up pass 0)
+    // also times each pixel sample, for per-pixel costs.
+    const bool timePixels = timeTiles && sampleNum > 0 &&
+        sampleNum % ty::kAdaptivePixelTimingInterval == 0 &&
+        _pixelTraceSeconds.size() == _pixelConverged.size() &&
+        _pixelTraceSamples.size() == _pixelConverged.size();
+    uint64_t chunkTraceNanoseconds = 0;
+
     // _RenderTiles gets a range of tiles; iterate through them.
     for (unsigned int tile = tileStart; tile < tileEnd; ++tile) {
         // Cancellation point.
         if (renderThread && renderThread->IsStopRequested()) {
             break;
         }
+
+        std::chrono::steady_clock::time_point tileTraceStart;
+        uint32_t tileTraceSamples = 0;
 
         // Compute the pixel location of tile boundaries.
         const unsigned int tileY = tile / numTilesX;
@@ -1010,6 +1335,14 @@ ty::Renderer::_RenderTiles(HdRenderThread *renderThread, int sampleNum,
                     continue;
                 }
 
+                if (timeTiles && tileTraceSamples++ == 0) {
+                    tileTraceStart = std::chrono::steady_clock::now();
+                }
+                std::chrono::steady_clock::time_point pixelTraceStart;
+                if (timePixels) {
+                    pixelTraceStart = std::chrono::steady_clock::now();
+                }
+
                 // Create a per-pixel OpenQMC sampler.
                 ty::Sampler sampler(
                     baseSeed,
@@ -1029,8 +1362,32 @@ ty::Renderer::_RenderTiles(HdRenderThread *renderThread, int sampleNum,
                     x, y,
                     posRayOrgWld, dirRayWld,
                     sampler, diffRay);
+
+                // idx is exclusive to this worker for the pass.
+                if (timePixels) {
+                    _pixelTraceSeconds[idx] += std::chrono::duration<float>(
+                        std::chrono::steady_clock::now() -
+                        pixelTraceStart).count();
+                    _pixelTraceSamples[idx] += 1.0f;
+                }
             }
         }
+
+        if (tileTraceSamples > 0) {
+            const std::chrono::nanoseconds tileTraceTime =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - tileTraceStart);
+            _tileTraceSeconds[tile] += 1e-9 * static_cast<double>(
+                tileTraceTime.count());
+            _tileTraceSamples[tile] += static_cast<double>(tileTraceSamples);
+            chunkTraceNanoseconds +=
+                static_cast<uint64_t>(tileTraceTime.count());
+        }
+    }
+
+    if (chunkTraceNanoseconds > 0) {
+        _passTraceCpuNanoseconds.fetch_add(
+            chunkTraceNanoseconds, std::memory_order_relaxed);
     }
 }
 

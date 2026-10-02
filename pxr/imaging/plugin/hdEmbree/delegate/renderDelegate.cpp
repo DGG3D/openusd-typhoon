@@ -7,7 +7,8 @@
 // Modified by DGG3D 2026: report the build's git commit (hdEmbreeBuildInfo.h,
 // generated at build time) via GetRenderStats()["buildCommit"] and print it
 // once per delegate instantiation. Also: report "activePixels" and a
-// remaining-time estimate ("estimatedSecondsRemaining") for the current frame.
+// remaining-time estimate ("estimatedSecondsRemaining") for the current frame,
+// and the per-level work prediction behind it ("predicted*" stats).
 //
 #include "renderDelegate.h"
 #include "instancer.h"
@@ -26,6 +27,7 @@
 
 #include "pxr/base/gf/colorSpace.h"
 #include "pxr/base/tf/diagnostic.h"
+#include "pxr/base/vt/types.h"
 #include "pxr/imaging/hd/bprim.h"
 #include "pxr/imaging/hd/camera.h"
 #include "pxr/imaging/hd/extComputation.h"
@@ -435,6 +437,72 @@ HdEmbreeRenderDelegate::GetRenderStats() const
     // (too few passes timed), 0 once complete.
     stats["estimatedSecondsRemaining"] =
         _renderer.GetEstimatedSecondsRemaining();
+
+    // Work prediction behind that estimate (see
+    // renderer/aov/adaptiveTimeEstimate.h), so clients can apply their own
+    // cost model. "predictionCompletedSamples" is always present (0 = no
+    // prediction yet); the rest only once a prediction exists. The arrays
+    // are indexed by adaptive level: level j covers passes
+    // (predictedLevelEndSamples[j - 1], predictedLevelEndSamples[j]], and
+    // entries before "predictedCurrentLevel" are 0.
+    ty::AdaptiveWorkPrediction work;
+    ty::AdaptivePassCostRates rates;
+    const bool hasWork = _renderer.GetAdaptiveWorkPrediction(&work, &rates);
+    stats["predictionCompletedSamples"] =
+        static_cast<int64_t>(hasWork ? work.completedPasses : 0);
+    if (hasWork) {
+        const size_t numLevels = static_cast<size_t>(work.numLevels);
+        VtInt64Array levelEndSamples(numLevels);
+        VtInt64Array activePixels(numLevels);
+        VtInt64Array activeTiles(numLevels);
+        VtDoubleArray traceCpuSeconds(numLevels);
+        VtDoubleArray traceWallSeconds(numLevels);
+        VtDoubleArray maxRunSeconds(numLevels);
+        VtDoubleArray passSeconds(numLevels);
+        for (size_t level = 0; level < numLevels; ++level) {
+            levelEndSamples[level] =
+                static_cast<int64_t>(work.levelEndPass[level]);
+            activePixels[level] =
+                static_cast<int64_t>(work.activePixels[level]);
+            activeTiles[level] =
+                static_cast<int64_t>(work.activeTiles[level]);
+            traceCpuSeconds[level] = work.traceCpuSeconds[level];
+            traceWallSeconds[level] = work.traceWallSeconds[level];
+            maxRunSeconds[level] = work.maxRunSeconds[level];
+            passSeconds[level] = (static_cast<int>(level) >= work.currentLevel)
+                ? ty::PredictAdaptivePassSeconds(
+                      work, static_cast<int>(level), rates)
+                : 0.0;
+        }
+        stats["predictedCurrentLevel"] =
+            static_cast<int64_t>(work.currentLevel);
+        stats["predictedLevelEndSamples"] = levelEndSamples;
+        // Pixels / tiles every pass of the level samples.
+        stats["predictedActivePixelsPerLevel"] = activePixels;
+        stats["predictedActiveTilesPerLevel"] = activeTiles;
+        // Tracing time of one pass of the level summed over its tiles
+        // (thread seconds, not wall seconds).
+        stats["predictedTraceCpuSecondsPerLevel"] = traceCpuSeconds;
+        // Predicted tile-loop makespan of one pass of the level (scheduled
+        // over "traceThreads" in runs of "traceRunTiles" consecutive tiles,
+        // uncalibrated) and the most expensive such run.
+        stats["predictedTraceWallSecondsPerLevel"] = traceWallSeconds;
+        stats["predictedMaxRunSecondsPerLevel"] = maxRunSeconds;
+        stats["traceThreads"] = static_cast<int64_t>(work.threads);
+        stats["traceRunTiles"] = static_cast<int64_t>(work.runTiles);
+        // Predicted wall seconds of one pass of the level, as used by
+        // "estimatedSecondsRemaining"; negative while the rates are
+        // unmeasured.
+        stats["predictedPassSecondsPerLevel"] = passSeconds;
+        stats["predictedRemainingPixelSamples"] =
+            static_cast<int64_t>(work.remainingPixelSamples);
+        // Measured per-pass wall time outside the tile loop, tile-loop wall
+        // time per summed tile second, and tile-loop wall time per predicted
+        // makespan second; negative while unmeasured.
+        stats["measuredPassOverheadSeconds"] = rates.overheadSeconds;
+        stats["measuredTraceWallPerCpuSecond"] = rates.traceWallPerCpuSecond;
+        stats["measuredTraceWallScale"] = rates.traceWallScale;
+    }
     stats["buildCommit"] = std::string(HDEMBREE_BUILD_COMMIT);
     return stats;
 }

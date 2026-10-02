@@ -7,7 +7,8 @@
 // Modified by DGG3D 2026: new file; factors the adaptive-sampling stopping
 // decision out of aovOutput.cpp and adds checkpointed stopping plus 3x3
 // neighbourhood agreement, so the renderer and its unit test share one
-// implementation.
+// implementation. Also: PredictAdaptivePassingCount for the remaining-time
+// estimate.
 //
 // Adaptive-sampling convergence decision.
 //
@@ -113,6 +114,40 @@ PassesAdaptiveTest(
     const GfVec3f varOfMean = m2 / (fCount * fCount);
     return IsPerChannelVarianceConverged(
         varOfMean, mean, relativeVarianceThreshold);
+}
+
+/// Predicted sample count at which a pixel's statistics first pass the
+/// adaptive test. Assumes the per-sample variance (m2 / count) and the mean
+/// keep their current estimates, so the variance of the mean that the test
+/// compares against its limit falls as 1 / n:
+///
+///     varOfMean(n) = m2 / (count * n) <= limit  <=>  n >= m2 / (count * limit)
+///
+/// Bookkeeping for the remaining-time estimate only; never used to retire a
+/// pixel. \return The largest per-channel count (0 for a constant pixel), or
+/// a negative value when \p count is 0 (nothing to predict from).
+inline double
+PredictAdaptivePassingCount(
+    GfVec3f const& mean, GfVec3f const& m2, uint32_t count,
+    float relativeVarianceThreshold)
+{
+    if (count == 0) {
+        return -1.0;
+    }
+    const double threshold =
+        static_cast<double>(std::max(0.0f, relativeVarianceThreshold));
+    double passingCount = 0.0;
+    for (int c = 0; c < 3; ++c) {
+        const double meanMagnitude = std::abs(static_cast<double>(mean[c]));
+        // Always positive: the absolute floor is.
+        const double varianceLimit =
+            static_cast<double>(kAdaptiveAbsoluteVarianceOfMean)
+            + threshold * meanMagnitude * meanMagnitude;
+        passingCount = std::max(passingCount,
+            static_cast<double>(m2[c]) /
+            (static_cast<double>(count) * varianceLimit));
+    }
+    return passingCount;
 }
 
 /// The per-sample step used by the render workers: accumulates the sample

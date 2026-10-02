@@ -7,7 +7,8 @@
 // Modified by DGG3D 2026. Also: checkpointed, neighbourhood-agreed adaptive
 // stopping (_pixelAdaptivePass, _RetireAgreedAdaptivePixels). Also: a
 // remaining-time estimate for the current frame (GetActivePixelCount,
-// GetEstimatedSecondsRemaining; renderer/aov/adaptiveTimeEstimate.h).
+// GetEstimatedSecondsRemaining; renderer/aov/adaptiveTimeEstimate.h), driven
+// by a per-pixel work prediction (GetAdaptiveWorkPrediction).
 //
 #ifndef PXR_IMAGING_PLUGIN_HD_EMBREE_RENDERER_H
 #define PXR_IMAGING_PLUGIN_HD_EMBREE_RENDERER_H
@@ -406,6 +407,19 @@ public:
     /// otherwise the estimate in seconds.
     double GetEstimatedSecondsRemaining() const;
 
+    /// \brief Get the current frame's work prediction and measured pass cost.
+    ///
+    /// Refreshed on the render thread at most about once a second and at
+    /// every adaptive checkpoint, from the first kAdaptivePredictionMinPasses
+    /// passes on (see renderer/aov/adaptiveTimeEstimate.h). Reset with the
+    /// remaining-time estimate.
+    /// \param outWork Receives the prediction; completedPasses 0 = none yet.
+    /// \param outRates Receives the measured pass costs; negative members
+    /// are unmeasured.
+    /// \return Whether a prediction exists.
+    bool GetAdaptiveWorkPrediction(AdaptiveWorkPrediction* outWork,
+                                   AdaptivePassCostRates* outRates) const;
+
     /// \brief Get overall frame progress as a percentage.
     ///
     /// Reports 100 once the renderer considers the frame complete, even if
@@ -548,8 +562,31 @@ private:
     /// \param passSeconds Wall-clock duration of the pass, including its
     /// retirement sweep, resolve and convergence check.
     /// \param timed Whether to use \p passSeconds in the pass-time fit.
+    /// \param traceSeconds Wall-clock duration of the pass's tile loop.
+    /// \param traceCpuSeconds Summed tracing time of the pass's tiles.
     void _UpdateTimeEstimate(int completedPasses, uint64_t activeBeforePass,
-                             double passSeconds, bool timed);
+                             double passSeconds, bool timed,
+                             double traceSeconds, double traceCpuSeconds);
+
+    /// \brief Buffer-space data window of the adaptive state.
+    ///
+    /// The data window is y-down but image rows are bottom-to-top, so it is
+    /// flipped, then clamped to the buffer so neighbour lookups stay inside.
+    /// \return false when the window is empty or no buffer is bound.
+    bool _GetAdaptiveWindow(AdaptiveWindow* outWindow) const;
+
+    /// \brief Predict the work left in the frame and hand it to the
+    /// remaining-time estimate. Bookkeeping only.
+    ///
+    /// Runs on the render thread between full-resolution passes, after the
+    /// retirement sweep. Predicts each active pixel's retirement level from
+    /// its statistics, raised to its active 3x3 neighbourhood's maximum, and
+    /// costs it with its own measured tracing time per sample (see
+    /// renderer/aov/adaptiveTimeEstimate.h). Two parallel sweeps over the
+    /// data window; no per-sample cost.
+    /// \param completedPasses Passes completed so far; every active pixel
+    /// holds this many samples.
+    void _UpdateWorkPrediction(int completedPasses);
 
     /// \brief Evaluate and write one selected pixel sample.
     ///
@@ -1226,10 +1263,33 @@ private:
     // guarded by _timeEstimateMutex (updated once per pass on the render
     // thread, reset from the reset sites); the derived value is published
     // through the atomic for GetRenderStats() polling from other threads.
-    // Negative means unknown.
-    std::mutex _timeEstimateMutex;
+    // Negative means unknown. Mutable so the const work-prediction getter
+    // can lock it.
+    mutable std::mutex _timeEstimateMutex;
     AdaptiveTimeEstimator _adaptiveTimeEstimator;
     std::atomic<double> _estimatedSecondsRemaining{-1.0};
+
+    // Modified by DGG3D 2026: inputs of the work prediction
+    // (_UpdateWorkPrediction). _pixelRetireLevel is render-thread scratch:
+    // 1 + the predicted retirement level of each active pixel, valid only
+    // for active pixels during one prediction. _tileTraceSeconds /
+    // _tileTraceSamples accumulate, per tile of the full-resolution passes,
+    // the time spent tracing its active pixels and the samples traced; each
+    // tile is written only by the worker tracing it, read and decayed by the
+    // render thread between passes. _passTraceCpuNanoseconds sums the
+    // current pass's tile times. _tileLevelSeconds is render-thread scratch:
+    // predicted tracing time per pass of each tile at each level
+    // (tile * numLevels + level). _pixelTraceSeconds / _pixelTraceSamples
+    // accumulate, per pixel, the tracing time and count of the samples timed
+    // on every kAdaptivePixelTimingInterval-th pass; written only by the
+    // pixel's worker, read between passes. Sized per Render() call.
+    std::vector<uint8_t> _pixelRetireLevel;
+    std::vector<double> _tileLevelSeconds;
+    std::vector<double> _tileTraceSeconds;
+    std::vector<double> _tileTraceSamples;
+    std::vector<float> _pixelTraceSeconds;
+    std::vector<float> _pixelTraceSamples;
+    std::atomic<uint64_t> _passTraceCpuNanoseconds{0};
 
     // How many samples have been completed.
     std::atomic<int> _completedSamples;

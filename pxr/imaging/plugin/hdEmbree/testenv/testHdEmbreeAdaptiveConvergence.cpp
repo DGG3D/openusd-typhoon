@@ -7,7 +7,8 @@
 // Modified by DGG3D 2026: new file; regression tests for checkpointed,
 // neighbourhood-agreed adaptive stopping (renderer/aov/adaptiveConvergence.h).
 // Also: unit tests for the remaining-time estimator
-// (renderer/aov/adaptiveTimeEstimate.h).
+// (renderer/aov/adaptiveTimeEstimate.h), including its work-prediction
+// model.
 //
 #include <renderer/aov/adaptiveConvergence.h>
 #include <renderer/aov/adaptiveTimeEstimate.h>
@@ -887,6 +888,103 @@ TestEtaUnknownUntilEnoughPassesTimed()
     return ok;
 }
 
+bool
+TestEtaFromWorkPrediction()
+{
+    bool ok = true;
+
+    // Levels end at the checkpoints 64, 128 and at the cap 256.
+    ty::AdaptiveWorkPrediction work;
+    work.numLevels = ty::BuildAdaptiveLevels(64, 256, work.levelEndPass);
+    ok &= ExpectNear("level count", work.numLevels, 3.0);
+    ok &= ExpectNear("level 0 end", double(work.levelEndPass[0]), 64.0);
+    ok &= ExpectNear("level 2 end", double(work.levelEndPass[2]), 256.0);
+    ok &= ExpectNear("level of pass 65", ty::AdaptiveLevelOfPass(
+        65, work.levelEndPass, work.numLevels), 1.0);
+
+    // Passing count: the variance of the mean falls as 1 / n, so the test
+    // limit is reached at m2 / (count * limit) samples.
+    const GfVec3f mean(0.5f);
+    const double limit = 1e-6 + 0.01 * 0.25;
+    const GfVec3f m2(static_cast<float>(100.0 * 16.0 * limit), 0.0f, 0.0f);
+    ok &= ExpectNear("passing count",
+        ty::PredictAdaptivePassingCount(mean, m2, 16, 0.01f), 100.0, 1e-6);
+    ok &= ExpectNear("constant pixel passes now",
+        ty::PredictAdaptivePassingCount(mean, GfVec3f(0.0f), 16, 0.01f),
+        0.0);
+
+    // Before the makespan scale is measured each level costs overhead +
+    // max(w, 1 / tiles) * traceCpuSeconds per pass: w = 0.25 for level 0
+    // (10 tiles), 1/2 and 1/1 for the others.
+    work.completedPasses = 32;
+    work.currentLevel = 0;
+    const uint64_t pixels[] = {100, 10, 1};
+    const uint64_t tiles[] = {10, 2, 1};
+    const double cpu[] = {0.1, 0.02, 0.01};
+    const double makespan[] = {0.02, 0.01, 0.005};
+    for (int level = 0; level < 3; ++level) {
+        work.activePixels[level] = pixels[level];
+        work.activeTiles[level] = tiles[level];
+        work.traceCpuSeconds[level] = cpu[level];
+        work.traceWallSeconds[level] = makespan[level];
+    }
+    ty::AdaptivePassCostRates rates;
+    rates.overheadSeconds = 0.001;
+    rates.traceWallPerCpuSecond = 0.25;
+    const double expected = 32 * (0.001 + 0.25 * 0.1)
+        + 64 * (0.001 + 0.5 * 0.02) + 128 * (0.001 + 1.0 * 0.01);
+    ok &= ExpectNear("work eta",
+        ty::PredictAdaptiveRemainingSecondsFromWork(work, 32, rates),
+        expected);
+    ok &= ExpectNear("work eta in level 1",
+        ty::PredictAdaptiveRemainingSecondsFromWork(work, 100, rates),
+        28 * (0.001 + 0.5 * 0.02) + 128 * (0.001 + 1.0 * 0.01));
+    ok &= ExpectNear("work eta at cap",
+        ty::PredictAdaptiveRemainingSecondsFromWork(work, 256, rates),
+        0.0);
+    ty::AdaptiveWorkPrediction retired = work;
+    retired.activePixels[2] = 0;
+    ok &= ExpectNear("work eta stops when nothing remains",
+        ty::PredictAdaptiveRemainingSecondsFromWork(retired, 32, rates),
+        32 * (0.001 + 0.25 * 0.1) + 64 * (0.001 + 0.5 * 0.02));
+
+    // Once measured, the makespan scale replaces w.
+    ty::AdaptivePassCostRates scaled = rates;
+    scaled.traceWallScale = 2.0;
+    ok &= ExpectNear("work eta with makespan scale",
+        ty::PredictAdaptiveRemainingSecondsFromWork(work, 32, scaled),
+        32 * (0.001 + 2.0 * 0.02) + 64 * (0.001 + 2.0 * 0.01)
+        + 128 * (0.001 + 2.0 * 0.005));
+
+    // Longest-first makespan: {5, 4, 3, 3, 3} on 2 threads -> 8 and 10.
+    std::vector<double> jobs = {3.0, 5.0, 3.0, 4.0, 3.0};
+    ok &= ExpectNear("makespan", ty::AdaptiveScheduleMakespan(&jobs, 2), 10.0);
+    std::vector<double> oneJob = {7.0};
+    ok &= ExpectNear("makespan bounded by largest job",
+        ty::AdaptiveScheduleMakespan(&oneJob, 8), 7.0);
+
+    // The estimator prefers the work prediction once a pass cost exists,
+    // and scales the predicted makespan by the measured one: level-0 passes
+    // traced in 0.025 s against a predicted 0.02 s -> scale 1.25.
+    ty::AdaptiveTimeEstimator estimator;
+    estimator.Reset();
+    estimator.SetWorkPrediction(work);
+    for (int pass = 30; pass < 34; ++pass) {
+        estimator.RecordPass(100, 0.026);
+        estimator.RecordPassCost(64, pass, 0.026, 0.025, 0.1);
+    }
+    ok &= ExpectNear("estimator uses work prediction",
+        estimator.EstimateRemainingSeconds(32, 100, 256, 64),
+        32 * (0.001 + 1.25 * 0.02) + 64 * (0.001 + 1.25 * 0.01)
+        + 128 * (0.001 + 1.25 * 0.005));
+    estimator.Reset();
+    if (estimator.GetWorkPrediction().completedPasses != 0) {
+        std::printf("    work prediction kept after Reset()\n");
+        ok = false;
+    }
+    return ok;
+}
+
 } // namespace
 
 int
@@ -926,6 +1024,8 @@ main()
          &TestEtaHalfRetirementPerCheckpoint},
         {"AdaptiveConvergence.TestEtaUnknownUntilEnoughPassesTimed",
          &TestEtaUnknownUntilEnoughPassesTimed},
+        {"AdaptiveConvergence.TestEtaFromWorkPrediction",
+         &TestEtaFromWorkPrediction},
     };
 
     int failed = 0;
